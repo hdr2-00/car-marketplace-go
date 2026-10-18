@@ -161,9 +161,9 @@ INSERT INTO car_listing_features (car_listing_id, feature_id, created_at) VALUES
 (5, 14, datetime('now')), -- navigation_system
 (5, 15, datetime('now')), -- bluetooth
 (5, 17, datetime('now')), -- apple_carplay
-(5, 22, datetime('now')), -- adaptive_cruise_control
-(5, 24, datetime('now')), -- keyless_entry
-(5, 25, datetime('now')); -- push_start
+(5, 20, datetime('now')), -- adaptive_cruise_control
+(5, 22, datetime('now')), -- keyless_entry
+(5, 23, datetime('now')); -- push_start
 
 -- Sample Car Images
 INSERT INTO car_images (car_listing_id, image_url, display_order, is_primary, created_at) VALUES

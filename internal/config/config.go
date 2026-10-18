@@ -5,10 +5,14 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/joho/godotenv"
 )
+
+// defaultJWTSecret is a development-only placeholder; Validate rejects it in release mode.
+const defaultJWTSecret = "your-super-secret-key-change-this-in-production"
 
 // Config holds all application configuration
 type Config struct {
@@ -16,6 +20,7 @@ type Config struct {
 	Database  DatabaseConfig
 	JWT       JWTConfig
 	RateLimit RateLimitConfig
+	CORS      CORSConfig
 }
 
 // ServerConfig holds server-related configuration
@@ -26,6 +31,16 @@ type ServerConfig struct {
 	ReadTimeout  time.Duration
 	WriteTimeout time.Duration
 	IdleTimeout  time.Duration
+	// CookieSecure sets the Secure flag on auth cookies (HTTPS only).
+	CookieSecure bool
+	// TrustedProxies lists proxy IPs/CIDRs allowed to set X-Forwarded-For.
+	// Empty means the client IP is always the TCP peer address.
+	TrustedProxies []string
+}
+
+// CORSConfig holds cross-origin settings
+type CORSConfig struct {
+	AllowedOrigins []string
 }
 
 // DatabaseConfig holds database-related configuration
@@ -63,6 +78,7 @@ func Load() (*Config, error) {
 		Database:  loadDatabaseConfig(),
 		JWT:       loadJWTConfig(),
 		RateLimit: loadRateLimitConfig(),
+		CORS:      loadCORSConfig(),
 	}
 
 	// Validate required fields
@@ -75,13 +91,23 @@ func Load() (*Config, error) {
 
 // loadServerConfig loads server configuration
 func loadServerConfig() ServerConfig {
+	mode := getEnv("GIN_MODE", "debug")
 	return ServerConfig{
-		Host:         getEnv("SERVER_HOST", "0.0.0.0"),
-		Port:         getEnv("SERVER_PORT", "8080"),
-		Mode:         getEnv("GIN_MODE", "debug"),
-		ReadTimeout:  getDurationEnv("SERVER_READ_TIMEOUT", 10*time.Second),
-		WriteTimeout: getDurationEnv("SERVER_WRITE_TIMEOUT", 10*time.Second),
-		IdleTimeout:  getDurationEnv("SERVER_IDLE_TIMEOUT", 60*time.Second),
+		Host:           getEnv("SERVER_HOST", "0.0.0.0"),
+		Port:           getEnv("SERVER_PORT", "8080"),
+		Mode:           mode,
+		ReadTimeout:    getDurationEnv("SERVER_READ_TIMEOUT", 10*time.Second),
+		WriteTimeout:   getDurationEnv("SERVER_WRITE_TIMEOUT", 10*time.Second),
+		IdleTimeout:    getDurationEnv("SERVER_IDLE_TIMEOUT", 60*time.Second),
+		CookieSecure:   getBoolEnv("COOKIE_SECURE", mode == "release"),
+		TrustedProxies: getListEnv("TRUSTED_PROXIES", nil),
+	}
+}
+
+// loadCORSConfig loads cross-origin configuration
+func loadCORSConfig() CORSConfig {
+	return CORSConfig{
+		AllowedOrigins: getListEnv("CORS_ALLOWED_ORIGINS", []string{"http://localhost:3000", "http://localhost:5173"}),
 	}
 }
 
@@ -98,7 +124,7 @@ func loadDatabaseConfig() DatabaseConfig {
 // loadJWTConfig loads JWT configuration
 func loadJWTConfig() JWTConfig {
 	return JWTConfig{
-		SecretKey:       getEnv("JWT_SECRET_KEY", "your-super-secret-key-change-this-in-production"),
+		SecretKey:       getEnv("JWT_SECRET_KEY", defaultJWTSecret),
 		AccessTokenTTL:  getDurationEnv("JWT_ACCESS_TOKEN_TTL", 15*time.Minute),
 		RefreshTokenTTL: getDurationEnv("JWT_REFRESH_TOKEN_TTL", 7*24*time.Hour), // 7 days
 	}
@@ -130,6 +156,10 @@ func (c *Config) Validate() error {
 
 	if len(c.JWT.SecretKey) < 32 {
 		return fmt.Errorf("JWT secret key must be at least 32 characters long")
+	}
+
+	if c.Server.Mode == "release" && c.JWT.SecretKey == defaultJWTSecret {
+		return fmt.Errorf("JWT_SECRET_KEY must be set to a real secret in release mode")
 	}
 
 	return nil
@@ -209,4 +239,21 @@ func getDurationEnv(key string, defaultValue time.Duration) time.Duration {
 	}
 
 	return value
+}
+
+// getListEnv gets a comma-separated environment variable or returns a default value
+func getListEnv(key string, defaultValue []string) []string {
+	valueStr := os.Getenv(key)
+	if valueStr == "" {
+		return defaultValue
+	}
+
+	var values []string
+	for _, v := range strings.Split(valueStr, ",") {
+		if v = strings.TrimSpace(v); v != "" {
+			values = append(values, v)
+		}
+	}
+
+	return values
 }

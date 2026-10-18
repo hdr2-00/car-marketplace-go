@@ -83,7 +83,7 @@ const docTemplate = `{
         },
         "/auth/login": {
             "post": {
-                "description": "Authenticate user and set access and refresh tokens as HTTP-only cookies",
+                "description": "Authenticate user and set access and refresh tokens as HTTP-only cookies. Protected endpoints accept the access_token cookie or an \"Authorization: Bearer\" header.",
                 "consumes": [
                     "application/json"
                 ],
@@ -132,6 +132,12 @@ const docTemplate = `{
                     },
                     "401": {
                         "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/response.Response"
+                        }
+                    },
+                    "403": {
+                        "description": "Account not active",
                         "schema": {
                             "$ref": "#/definitions/response.Response"
                         }
@@ -280,7 +286,7 @@ const docTemplate = `{
         },
         "/auth/refresh": {
             "post": {
-                "description": "Generate new access token using refresh token from cookie",
+                "description": "Exchange the refresh token cookie for new access and refresh tokens. Each refresh token can be used once.",
                 "consumes": [
                     "application/json"
                 ],
@@ -298,14 +304,14 @@ const docTemplate = `{
                             "$ref": "#/definitions/response.Response"
                         }
                     },
-                    "400": {
-                        "description": "Bad Request",
+                    "401": {
+                        "description": "Unauthorized",
                         "schema": {
                             "$ref": "#/definitions/response.Response"
                         }
                     },
-                    "401": {
-                        "description": "Unauthorized",
+                    "403": {
+                        "description": "Forbidden",
                         "schema": {
                             "$ref": "#/definitions/response.Response"
                         }
@@ -435,31 +441,31 @@ const docTemplate = `{
                     },
                     {
                         "type": "string",
-                        "description": "City",
+                        "description": "City (case-insensitive)",
                         "name": "city",
                         "in": "query"
                     },
                     {
                         "type": "string",
-                        "description": "State",
+                        "description": "State (case-insensitive)",
                         "name": "state",
                         "in": "query"
                     },
                     {
                         "type": "string",
-                        "description": "Country",
+                        "description": "Country (case-insensitive)",
                         "name": "country",
                         "in": "query"
                     },
                     {
                         "type": "string",
-                        "description": "Search in title and description",
+                        "description": "Full-text search in title and description (matches word prefixes)",
                         "name": "search",
                         "in": "query"
                     },
                     {
                         "type": "string",
-                        "description": "Sort by (price_asc, price_desc, year_asc, year_desc, created_asc, created_desc)",
+                        "description": "Sort by (price_asc, price_desc, year_asc, year_desc, mileage_asc, mileage_desc, created_asc, created_desc)",
                         "name": "sort_by",
                         "in": "query"
                     },
@@ -573,6 +579,12 @@ const docTemplate = `{
                             "$ref": "#/definitions/response.Response"
                         }
                     },
+                    "409": {
+                        "description": "VIN already listed",
+                        "schema": {
+                            "$ref": "#/definitions/response.Response"
+                        }
+                    },
                     "500": {
                         "description": "Internal Server Error",
                         "schema": {
@@ -584,7 +596,7 @@ const docTemplate = `{
         },
         "/cars/{id}": {
             "get": {
-                "description": "Get detailed information about a car listing",
+                "description": "Get detailed information about a car listing, including its make, model, images and features. Views by the owner are not counted.",
                 "consumes": [
                     "application/json"
                 ],
@@ -643,7 +655,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Update an existing car listing (owner only)",
+                "description": "Update an existing car listing (owner only). Status may only be set to active or inactive; use the sold endpoint to mark a car as sold.",
                 "consumes": [
                     "application/json"
                 ],
@@ -715,6 +727,12 @@ const docTemplate = `{
                             "$ref": "#/definitions/response.Response"
                         }
                     },
+                    "409": {
+                        "description": "Conflict",
+                        "schema": {
+                            "$ref": "#/definitions/response.Response"
+                        }
+                    },
                     "500": {
                         "description": "Internal Server Error",
                         "schema": {
@@ -745,6 +763,236 @@ const docTemplate = `{
                         "type": "integer",
                         "description": "Car Listing ID",
                         "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/response.Response"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/response.Response"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/response.Response"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/response.Response"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/response.Response"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/response.Response"
+                        }
+                    }
+                }
+            }
+        },
+        "/cars/{id}/images": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Append an image URL to a listing (owner only). The first image becomes the primary image.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "cars"
+                ],
+                "summary": "Add an image to a listing",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Car Listing ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Image",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/domain.AddImageRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "201": {
+                        "description": "Created",
+                        "schema": {
+                            "allOf": [
+                                {
+                                    "$ref": "#/definitions/response.Response"
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "data": {
+                                            "$ref": "#/definitions/domain.CarImage"
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/response.Response"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/response.Response"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/response.Response"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/response.Response"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/response.Response"
+                        }
+                    }
+                }
+            }
+        },
+        "/cars/{id}/images/{image_id}": {
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Delete an image from a listing (owner only). If it was the primary image, the next image becomes primary.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "cars"
+                ],
+                "summary": "Delete a listing image",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Car Listing ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Image ID",
+                        "name": "image_id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/response.Response"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/response.Response"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/response.Response"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/response.Response"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/response.Response"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/response.Response"
+                        }
+                    }
+                }
+            }
+        },
+        "/cars/{id}/images/{image_id}/primary": {
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Make an image the listing's primary image (owner only)",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "cars"
+                ],
+                "summary": "Set a listing's primary image",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Car Listing ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Image ID",
+                        "name": "image_id",
                         "in": "path",
                         "required": true
                     }
@@ -843,6 +1091,12 @@ const docTemplate = `{
                     },
                     "404": {
                         "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/response.Response"
+                        }
+                    },
+                    "409": {
+                        "description": "Already sold",
                         "schema": {
                             "$ref": "#/definitions/response.Response"
                         }
@@ -985,6 +1239,12 @@ const docTemplate = `{
                             "$ref": "#/definitions/response.Response"
                         }
                     },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/response.Response"
+                        }
+                    },
                     "409": {
                         "description": "Conflict",
                         "schema": {
@@ -1061,7 +1321,7 @@ const docTemplate = `{
         },
         "/health": {
             "get": {
-                "description": "Check if the API is running",
+                "description": "Check that the API and its database are available",
                 "consumes": [
                     "application/json"
                 ],
@@ -1079,6 +1339,13 @@ const docTemplate = `{
                             "type": "object",
                             "additionalProperties": true
                         }
+                    },
+                    "503": {
+                        "description": "Service Unavailable",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
                     }
                 }
             }
@@ -1090,7 +1357,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Get list of inquiries (sent or received)",
+                "description": "List inquiries the authenticated user sent or received. buyer_id / seller_id may only be the user's own ID.",
                 "consumes": [
                     "application/json"
                 ],
@@ -1106,6 +1373,18 @@ const docTemplate = `{
                         "type": "integer",
                         "description": "Car listing ID",
                         "name": "car_listing_id",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Only inquiries sent by this user (must be yourself)",
+                        "name": "buyer_id",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Only inquiries received by this user (must be yourself)",
+                        "name": "seller_id",
                         "in": "query"
                     },
                     {
@@ -1153,6 +1432,12 @@ const docTemplate = `{
                     },
                     "401": {
                         "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/response.Response"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
                         "schema": {
                             "$ref": "#/definitions/response.Response"
                         }
@@ -1220,6 +1505,12 @@ const docTemplate = `{
                     },
                     "401": {
                         "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/response.Response"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
                         "schema": {
                             "$ref": "#/definitions/response.Response"
                         }
@@ -1343,7 +1634,19 @@ const docTemplate = `{
                     "200": {
                         "description": "OK",
                         "schema": {
-                            "$ref": "#/definitions/response.Response"
+                            "allOf": [
+                                {
+                                    "$ref": "#/definitions/response.Response"
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "data": {
+                                            "$ref": "#/definitions/domain.ReferenceData"
+                                        }
+                                    }
+                                }
+                            ]
                         }
                     },
                     "500": {
@@ -1547,7 +1850,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Create a review for a user",
+                "description": "Create a review for a user, optionally tied to one of their listings",
                 "consumes": [
                     "application/json"
                 ],
@@ -1596,6 +1899,18 @@ const docTemplate = `{
                     },
                     "401": {
                         "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/response.Response"
+                        }
+                    },
+                    "404": {
+                        "description": "Reviewed user or listing not found",
+                        "schema": {
+                            "$ref": "#/definitions/response.Response"
+                        }
+                    },
+                    "409": {
+                        "description": "Already reviewed",
                         "schema": {
                             "$ref": "#/definitions/response.Response"
                         }
@@ -1820,6 +2135,19 @@ const docTemplate = `{
         }
     },
     "definitions": {
+        "domain.AddImageRequest": {
+            "type": "object",
+            "required": [
+                "image_url"
+            ],
+            "properties": {
+                "image_url": {
+                    "type": "string",
+                    "maxLength": 2048,
+                    "example": "https://example.com/car.jpg"
+                }
+            }
+        },
         "domain.BodyType": {
             "type": "object",
             "properties": {
@@ -2365,6 +2693,47 @@ const docTemplate = `{
                 }
             }
         },
+        "domain.ReferenceData": {
+            "type": "object",
+            "properties": {
+                "body_types": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/domain.BodyType"
+                    }
+                },
+                "colors": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/domain.Color"
+                    }
+                },
+                "conditions": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/domain.CarCondition"
+                    }
+                },
+                "features": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/domain.Feature"
+                    }
+                },
+                "fuel_types": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/domain.FuelType"
+                    }
+                },
+                "transmissions": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/domain.TransmissionType"
+                    }
+                }
+            }
+        },
         "domain.RegisterRequest": {
             "type": "object",
             "required": [
@@ -2571,12 +2940,10 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "status": {
+                    "description": "Status may only toggle between active and inactive; use the\nmark-as-sold endpoint to sell a car.",
                     "type": "string",
                     "enum": [
                         "active",
-                        "sold",
-                        "pending",
-                        "expired",
                         "inactive"
                     ]
                 },

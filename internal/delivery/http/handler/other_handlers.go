@@ -5,7 +5,6 @@ import (
 	"car-marketplace/internal/usecase"
 	"car-marketplace/pkg/response"
 	"net/http"
-	"strconv"
 
 	"github.com/gin-gonic/gin"
 )
@@ -33,27 +32,24 @@ func NewInquiryHandler(inquiryUseCase usecase.InquiryUseCase) *InquiryHandler {
 // @Success 201 {object} response.Response{data=domain.Inquiry}
 // @Failure 400 {object} response.Response
 // @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
 // @Failure 500 {object} response.Response
 // @Router /inquiries [post]
 func (h *InquiryHandler) Create(c *gin.Context) {
-	userID, _ := c.Get("user_id")
-
-	var req domain.CreateInquiryRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		response.Error(c, http.StatusBadRequest, "Invalid request body", err)
+	userID, ok := requireUserID(c)
+	if !ok {
 		return
 	}
 
-	inquiry, err := h.inquiryUseCase.Create(c.Request.Context(), &req, userID.(int64))
+	var req domain.CreateInquiryRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		bindError(c, "Invalid request body", err)
+		return
+	}
+
+	inquiry, err := h.inquiryUseCase.Create(c.Request.Context(), &req, userID)
 	if err != nil {
-		switch err {
-		case domain.ErrCannotInquireOwn:
-			response.Error(c, http.StatusBadRequest, "You cannot inquire about your own listing", err)
-		case domain.ErrCarListingNotFound:
-			response.Error(c, http.StatusNotFound, "Car listing not found", err)
-		default:
-			response.Error(c, http.StatusInternalServerError, "Failed to create inquiry", err)
-		}
+		respondError(c, err)
 		return
 	}
 
@@ -62,44 +58,46 @@ func (h *InquiryHandler) Create(c *gin.Context) {
 
 // List godoc
 // @Summary List inquiries
-// @Description Get list of inquiries (sent or received)
+// @Description List inquiries the authenticated user sent or received. buyer_id / seller_id may only be the user's own ID.
 // @Tags inquiries
 // @Accept json
 // @Produce json
 // @Security BearerAuth
 // @Param car_listing_id query int false "Car listing ID"
+// @Param buyer_id query int false "Only inquiries sent by this user (must be yourself)"
+// @Param seller_id query int false "Only inquiries received by this user (must be yourself)"
 // @Param is_read query boolean false "Read status"
 // @Param page query int false "Page number" default(1)
 // @Param limit query int false "Items per page" default(20)
 // @Success 200 {object} response.PaginatedResponse{data=[]domain.Inquiry}
 // @Failure 401 {object} response.Response
+// @Failure 403 {object} response.Response
 // @Failure 500 {object} response.Response
 // @Router /inquiries [get]
 func (h *InquiryHandler) List(c *gin.Context) {
-	userID, _ := c.Get("user_id")
+	userID, ok := requireUserID(c)
+	if !ok {
+		return
+	}
 
 	var filter domain.InquiryFilter
 	if err := c.ShouldBindQuery(&filter); err != nil {
-		response.Error(c, http.StatusBadRequest, "Invalid query parameters", err)
+		bindError(c, "Invalid query parameters", err)
 		return
 	}
 
-	filter.SetDefaults()
-
-	inquiries, total, err := h.inquiryUseCase.List(c.Request.Context(), &filter, userID.(int64))
+	inquiries, total, err := h.inquiryUseCase.List(c.Request.Context(), &filter, userID)
 	if err != nil {
-		response.Error(c, http.StatusInternalServerError, "Failed to list inquiries", err)
+		respondError(c, err)
 		return
 	}
 
-	pagination := response.PaginationMeta{
+	response.Paginated(c, http.StatusOK, "Inquiries retrieved successfully", inquiries, response.PaginationMeta{
 		Page:       filter.Page,
 		PerPage:    filter.Limit,
 		Total:      total,
-		TotalPages: int((total + int64(filter.Limit) - 1) / int64(filter.Limit)),
-	}
-
-	response.Paginated(c, http.StatusOK, "Inquiries retrieved successfully", inquiries, pagination)
+		TotalPages: totalPages(total, filter.Limit),
+	})
 }
 
 // MarkAsRead godoc
@@ -118,23 +116,18 @@ func (h *InquiryHandler) List(c *gin.Context) {
 // @Failure 500 {object} response.Response
 // @Router /inquiries/{id}/read [put]
 func (h *InquiryHandler) MarkAsRead(c *gin.Context) {
-	userID, _ := c.Get("user_id")
-
-	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
-	if err != nil {
-		response.Error(c, http.StatusBadRequest, "Invalid inquiry ID", err)
+	userID, ok := requireUserID(c)
+	if !ok {
 		return
 	}
 
-	if err := h.inquiryUseCase.MarkAsRead(c.Request.Context(), id, userID.(int64)); err != nil {
-		switch err {
-		case domain.ErrInquiryNotFound:
-			response.Error(c, http.StatusNotFound, "Inquiry not found", err)
-		case domain.ErrInquiryNotOwner:
-			response.Error(c, http.StatusForbidden, "Not authorized", err)
-		default:
-			response.Error(c, http.StatusInternalServerError, "Failed to mark as read", err)
-		}
+	id, ok := pathID(c, "id", "inquiry ID")
+	if !ok {
+		return
+	}
+
+	if err := h.inquiryUseCase.MarkAsRead(c.Request.Context(), id, userID); err != nil {
+		respondError(c, err)
 		return
 	}
 
@@ -155,7 +148,7 @@ func NewReviewHandler(reviewUseCase usecase.ReviewUseCase) *ReviewHandler {
 
 // Create godoc
 // @Summary Create a review
-// @Description Create a review for a user
+// @Description Create a review for a user, optionally tied to one of their listings
 // @Tags reviews
 // @Accept json
 // @Produce json
@@ -164,27 +157,25 @@ func NewReviewHandler(reviewUseCase usecase.ReviewUseCase) *ReviewHandler {
 // @Success 201 {object} response.Response{data=domain.Review}
 // @Failure 400 {object} response.Response
 // @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response "Reviewed user or listing not found"
+// @Failure 409 {object} response.Response "Already reviewed"
 // @Failure 500 {object} response.Response
 // @Router /reviews [post]
 func (h *ReviewHandler) Create(c *gin.Context) {
-	userID, _ := c.Get("user_id")
-
-	var req domain.CreateReviewRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		response.Error(c, http.StatusBadRequest, "Invalid request body", err)
+	userID, ok := requireUserID(c)
+	if !ok {
 		return
 	}
 
-	review, err := h.reviewUseCase.Create(c.Request.Context(), &req, userID.(int64))
+	var req domain.CreateReviewRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		bindError(c, "Invalid request body", err)
+		return
+	}
+
+	review, err := h.reviewUseCase.Create(c.Request.Context(), &req, userID)
 	if err != nil {
-		switch err {
-		case domain.ErrCannotReviewSelf:
-			response.Error(c, http.StatusBadRequest, "You cannot review yourself", err)
-		case domain.ErrReviewAlreadyExists:
-			response.Error(c, http.StatusConflict, "You have already reviewed this user", err)
-		default:
-			response.Error(c, http.StatusInternalServerError, "Failed to create review", err)
-		}
+		respondError(c, err)
 		return
 	}
 
@@ -209,26 +200,22 @@ func (h *ReviewHandler) Create(c *gin.Context) {
 func (h *ReviewHandler) List(c *gin.Context) {
 	var filter domain.ReviewFilter
 	if err := c.ShouldBindQuery(&filter); err != nil {
-		response.Error(c, http.StatusBadRequest, "Invalid query parameters", err)
+		bindError(c, "Invalid query parameters", err)
 		return
 	}
-
-	filter.SetDefaults()
 
 	reviews, total, err := h.reviewUseCase.List(c.Request.Context(), &filter)
 	if err != nil {
-		response.Error(c, http.StatusInternalServerError, "Failed to list reviews", err)
+		respondError(c, err)
 		return
 	}
 
-	pagination := response.PaginationMeta{
+	response.Paginated(c, http.StatusOK, "Reviews retrieved successfully", reviews, response.PaginationMeta{
 		Page:       filter.Page,
 		PerPage:    filter.Limit,
 		Total:      total,
-		TotalPages: int((total + int64(filter.Limit) - 1) / int64(filter.Limit)),
-	}
-
-	response.Paginated(c, http.StatusOK, "Reviews retrieved successfully", reviews, pagination)
+		TotalPages: totalPages(total, filter.Limit),
+	})
 }
 
 // Update godoc
@@ -248,30 +235,25 @@ func (h *ReviewHandler) List(c *gin.Context) {
 // @Failure 500 {object} response.Response
 // @Router /reviews/{id} [put]
 func (h *ReviewHandler) Update(c *gin.Context) {
-	userID, _ := c.Get("user_id")
+	userID, ok := requireUserID(c)
+	if !ok {
+		return
+	}
 
-	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
-	if err != nil {
-		response.Error(c, http.StatusBadRequest, "Invalid review ID", err)
+	id, ok := pathID(c, "id", "review ID")
+	if !ok {
 		return
 	}
 
 	var req domain.UpdateReviewRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.Error(c, http.StatusBadRequest, "Invalid request body", err)
+		bindError(c, "Invalid request body", err)
 		return
 	}
 
-	review, err := h.reviewUseCase.Update(c.Request.Context(), id, &req, userID.(int64))
+	review, err := h.reviewUseCase.Update(c.Request.Context(), id, &req, userID)
 	if err != nil {
-		switch err {
-		case domain.ErrReviewNotFound:
-			response.Error(c, http.StatusNotFound, "Review not found", err)
-		case domain.ErrReviewNotOwner:
-			response.Error(c, http.StatusForbidden, "You are not the owner of this review", err)
-		default:
-			response.Error(c, http.StatusInternalServerError, "Failed to update review", err)
-		}
+		respondError(c, err)
 		return
 	}
 
@@ -294,23 +276,18 @@ func (h *ReviewHandler) Update(c *gin.Context) {
 // @Failure 500 {object} response.Response
 // @Router /reviews/{id} [delete]
 func (h *ReviewHandler) Delete(c *gin.Context) {
-	userID, _ := c.Get("user_id")
-
-	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
-	if err != nil {
-		response.Error(c, http.StatusBadRequest, "Invalid review ID", err)
+	userID, ok := requireUserID(c)
+	if !ok {
 		return
 	}
 
-	if err := h.reviewUseCase.Delete(c.Request.Context(), id, userID.(int64)); err != nil {
-		switch err {
-		case domain.ErrReviewNotFound:
-			response.Error(c, http.StatusNotFound, "Review not found", err)
-		case domain.ErrReviewNotOwner:
-			response.Error(c, http.StatusForbidden, "You are not the owner of this review", err)
-		default:
-			response.Error(c, http.StatusInternalServerError, "Failed to delete review", err)
-		}
+	id, ok := pathID(c, "id", "review ID")
+	if !ok {
+		return
+	}
+
+	if err := h.reviewUseCase.Delete(c.Request.Context(), id, userID); err != nil {
+		respondError(c, err)
 		return
 	}
 
@@ -329,15 +306,14 @@ func (h *ReviewHandler) Delete(c *gin.Context) {
 // @Failure 500 {object} response.Response
 // @Router /reviews/users/{user_id}/stats [get]
 func (h *ReviewHandler) GetUserStats(c *gin.Context) {
-	userID, err := strconv.ParseInt(c.Param("user_id"), 10, 64)
-	if err != nil {
-		response.Error(c, http.StatusBadRequest, "Invalid user ID", err)
+	userID, ok := pathID(c, "user_id", "user ID")
+	if !ok {
 		return
 	}
 
 	stats, err := h.reviewUseCase.GetUserStats(c.Request.Context(), userID)
 	if err != nil {
-		response.Error(c, http.StatusInternalServerError, "Failed to get user stats", err)
+		respondError(c, err)
 		return
 	}
 
@@ -367,30 +343,24 @@ func NewFavoriteHandler(favoriteUseCase usecase.FavoriteUseCase) *FavoriteHandle
 // @Success 201 {object} response.Response{data=domain.Favorite}
 // @Failure 400 {object} response.Response
 // @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
 // @Failure 409 {object} response.Response
 // @Failure 500 {object} response.Response
 // @Router /favorites/{id} [post]
 func (h *FavoriteHandler) Add(c *gin.Context) {
-	userID, _ := c.Get("user_id")
-
-	carListingID, err := strconv.ParseInt(c.Param("id"), 10, 64)
-	if err != nil {
-		response.Error(c, http.StatusBadRequest, "Invalid car listing ID", err)
+	userID, ok := requireUserID(c)
+	if !ok {
 		return
 	}
 
-	favorite, err := h.favoriteUseCase.Add(c.Request.Context(), carListingID, userID.(int64))
+	carListingID, ok := pathID(c, "id", "car listing ID")
+	if !ok {
+		return
+	}
+
+	favorite, err := h.favoriteUseCase.Add(c.Request.Context(), carListingID, userID)
 	if err != nil {
-		switch err {
-		case domain.ErrCannotFavoriteOwn:
-			response.Error(c, http.StatusBadRequest, "You cannot favorite your own listing", err)
-		case domain.ErrFavoriteAlreadyExists:
-			response.Error(c, http.StatusConflict, "Already in favorites", err)
-		case domain.ErrCarListingNotFound:
-			response.Error(c, http.StatusNotFound, "Car listing not found", err)
-		default:
-			response.Error(c, http.StatusInternalServerError, "Failed to add to favorites", err)
-		}
+		respondError(c, err)
 		return
 	}
 
@@ -412,21 +382,18 @@ func (h *FavoriteHandler) Add(c *gin.Context) {
 // @Failure 500 {object} response.Response
 // @Router /favorites/{id} [delete]
 func (h *FavoriteHandler) Remove(c *gin.Context) {
-	userID, _ := c.Get("user_id")
-
-	carListingID, err := strconv.ParseInt(c.Param("id"), 10, 64)
-	if err != nil {
-		response.Error(c, http.StatusBadRequest, "Invalid car listing ID", err)
+	userID, ok := requireUserID(c)
+	if !ok {
 		return
 	}
 
-	if err := h.favoriteUseCase.Remove(c.Request.Context(), carListingID, userID.(int64)); err != nil {
-		switch err {
-		case domain.ErrFavoriteNotFound:
-			response.Error(c, http.StatusNotFound, "Favorite not found", err)
-		default:
-			response.Error(c, http.StatusInternalServerError, "Failed to remove from favorites", err)
-		}
+	carListingID, ok := pathID(c, "id", "car listing ID")
+	if !ok {
+		return
+	}
+
+	if err := h.favoriteUseCase.Remove(c.Request.Context(), carListingID, userID); err != nil {
+		respondError(c, err)
 		return
 	}
 
@@ -447,29 +414,28 @@ func (h *FavoriteHandler) Remove(c *gin.Context) {
 // @Failure 500 {object} response.Response
 // @Router /favorites [get]
 func (h *FavoriteHandler) List(c *gin.Context) {
-	userID, _ := c.Get("user_id")
+	userID, ok := requireUserID(c)
+	if !ok {
+		return
+	}
 
 	var filter domain.FavoriteFilter
 	if err := c.ShouldBindQuery(&filter); err != nil {
-		response.Error(c, http.StatusBadRequest, "Invalid query parameters", err)
+		bindError(c, "Invalid query parameters", err)
 		return
 	}
-
-	filter.UserID = userID.(int64)
-	filter.SetDefaults()
+	filter.UserID = userID
 
 	favorites, total, err := h.favoriteUseCase.List(c.Request.Context(), &filter)
 	if err != nil {
-		response.Error(c, http.StatusInternalServerError, "Failed to list favorites", err)
+		respondError(c, err)
 		return
 	}
 
-	pagination := response.PaginationMeta{
+	response.Paginated(c, http.StatusOK, "Favorites retrieved successfully", favorites, response.PaginationMeta{
 		Page:       filter.Page,
 		PerPage:    filter.Limit,
 		Total:      total,
-		TotalPages: int((total + int64(filter.Limit) - 1) / int64(filter.Limit)),
-	}
-
-	response.Paginated(c, http.StatusOK, "Favorites retrieved successfully", favorites, pagination)
+		TotalPages: totalPages(total, filter.Limit),
+	})
 }

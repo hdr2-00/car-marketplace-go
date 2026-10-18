@@ -44,8 +44,8 @@ type ReviewFilter struct {
 	CarListingID   *int64 `form:"car_listing_id"`
 	MinRating      *int   `form:"min_rating" binding:"omitempty,min=1,max=5"`
 	MaxRating      *int   `form:"max_rating" binding:"omitempty,min=1,max=5"`
-	Page           int    `form:"page" binding:"min=1"`
-	Limit          int    `form:"limit" binding:"min=1,max=100"`
+	Page           int    `form:"page" binding:"omitempty,min=1"`
+	Limit          int    `form:"limit" binding:"omitempty,min=1,max=100"`
 }
 
 // SetDefaults sets default values for pagination

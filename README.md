@@ -8,8 +8,11 @@ A RESTful API for an online car marketplace built with Go, Gin framework, and SQ
 go-online-marketplace/
 ├── cmd/
 │   └── api/
-│       └── main.go                 # Application entry point
+│       └── main.go                 # Entry point (-migrate-only, -seed flags)
 ├── internal/
+│   ├── app/
+│   │   ├── app.go                  # Dependency wiring and background jobs
+│   │   └── app_test.go             # HTTP integration tests
 │   ├── config/
 │   │   └── config.go               # Configuration management
 │   ├── domain/
@@ -23,17 +26,21 @@ go-online-marketplace/
 │   ├── repository/
 │   │   ├── user_repository.go      # User repo interface
 │   │   ├── car_repository.go       # Car repo interface
-│   │   └── other_repositories.go   # Other repo interfaces
+│   │   ├── other_repositories.go   # Other repo interfaces
+│   │   └── transactor.go           # Transaction interface
 │   ├── usecase/
 │   │   ├── auth_usecase.go         # Auth business logic
 │   │   ├── car_usecase.go          # Car business logic
-│   │   └── other_usecases.go       # Other business logic
+│   │   ├── other_usecases.go       # Other business logic
+│   │   ├── reference_cache.go      # In-memory reference data
+│   │   └── view_counter.go         # Batched listing view counts
 │   ├── delivery/
 │   │   └── http/
 │   │       ├── handler/
 │   │       │   ├── auth_handler.go # Auth HTTP handlers
 │   │       │   ├── car_handler.go  # Car HTTP handlers
-│   │       │   └── other_handlers.go # Other HTTP handlers
+│   │       │   ├── other_handlers.go # Other HTTP handlers
+│   │       │   └── errors.go       # Domain error → HTTP status mapping
 │   │       ├── middleware/
 │   │       │   ├── auth_middleware.go # JWT validation
 │   │       │   ├── cors_middleware.go # CORS support
@@ -44,26 +51,25 @@ go-online-marketplace/
 │       ├── database/
 │       │   └── sqlite/
 │       │       ├── sqlite.go       # DB connection
+│       │       ├── migrate.go      # Embedded migration runner
+│       │       ├── tx.go           # Context-scoped transactions
 │       │       ├── user_repository.go # User data access
 │       │       ├── car_repository.go # Car data access
 │       │       └── other_repositories.go # Other data access
-│       ├── security/
-│       │   ├── jwt.go              # JWT utilities
-│       │   └── password.go         # Password hashing
-│       └── validator/
-│           └── validator.go        # Input validation
+│       └── security/
+│           ├── jwt.go              # JWT utilities
+│           └── password.go         # Password hashing
 ├── pkg/
-│   ├── response/
-│   │   └── response.go             # Response helpers
-│   └── logger/
-│       └── logger.go               # Logging utilities
+│   └── response/
+│       └── response.go             # Response helpers
 ├── migrations/
+│   ├── embed.go                    # Embeds the SQL files into the binary
 │   ├── 001_initial_schema.sql      # Database schema
-│   └── 002_sample_data.sql         # Sample data
+│   ├── 002_search_and_integrity.sql # Full-text search, indexes, constraints
+│   └── seeds/
+│       └── sample_data.sql         # Sample data (loaded with -seed)
 ├── docs/
 │   └── swagger/                    # Swagger documentation
-├── tests/                          # Test files
-├── config.yaml                     # Default configuration
 ├── .env.example                    # Example environment file
 ├── Makefile                        # Build commands
 ├── go.mod                          # Go modules
@@ -161,6 +167,10 @@ make setup
 # This runs: deps, migrate-fresh, and swagger
 ```
 
+The server applies pending migrations automatically on startup, so the
+`sqlite3` CLI is not required. To load the sample data, run
+`make migrate-with-data` (or `go run ./cmd/api -migrate-only -seed`).
+
 ## Configuration
 
 ### Environment Variables
@@ -181,6 +191,11 @@ GIN_MODE=debug  # debug, release, test
 SERVER_READ_TIMEOUT=10s
 SERVER_WRITE_TIMEOUT=10s
 SERVER_IDLE_TIMEOUT=60s
+COOKIE_SECURE=false        # Secure auth cookies; defaults to true in release mode
+TRUSTED_PROXIES=           # Proxies allowed to set X-Forwarded-For (empty = none)
+
+# CORS Configuration
+CORS_ALLOWED_ORIGINS=http://localhost:3000,http://localhost:5173
 
 # Database Configuration
 DATABASE_PATH=./data/marketplace.db
@@ -203,8 +218,10 @@ RATE_LIMIT_CLEANUP=5m
 ```
 
 **CRITICAL for Production**:
-- Generate a strong `JWT_SECRET_KEY` (at least 32 characters): `openssl rand -base64 64`
+- Generate a strong `JWT_SECRET_KEY` (at least 32 characters): `openssl rand -base64 64`.
+  The server refuses to start in release mode with the built-in placeholder.
 - Set `GIN_MODE=release` for production
+- Behind a reverse proxy, set `TRUSTED_PROXIES` so rate limiting sees real client IPs
 - Use appropriate database path and backup strategy
 - Adjust rate limiting based on your needs
 
@@ -272,18 +289,21 @@ http://localhost:8080/swagger/index.html
 
 1. **Register a new user**:
 ```bash
-curl -X POST http://localhost:8080/auth/register \
+curl -X POST http://localhost:8080/api/v1/auth/register \
   -H "Content-Type: application/json" \
   -d '{
     "email": "user@example.com",
     "password": "password123",
-    "user_type": "individual"
+    "user_type": "individual",
+    "first_name": "Jane",
+    "last_name": "Doe"
   }'
 ```
 
-2. **Login**:
+2. **Login** (tokens are set as HTTP-only cookies; `-c` saves them):
 ```bash
-curl -X POST http://localhost:8080/auth/login \
+curl -X POST http://localhost:8080/api/v1/auth/login \
+  -c cookies.txt \
   -H "Content-Type: application/json" \
   -d '{
     "email": "user@example.com",
@@ -291,29 +311,37 @@ curl -X POST http://localhost:8080/auth/login \
   }'
 ```
 
-3. **Create a car listing** (requires authentication):
+3. **Create a car listing** (requires authentication; send the cookies with `-b`,
+or an `Authorization: Bearer <access_token>` header):
 ```bash
-curl -X POST http://localhost:8080/cars \
+curl -X POST http://localhost:8080/api/v1/cars \
+  -b cookies.txt \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer YOUR_ACCESS_TOKEN" \
   -d '{
     "make_id": 1,
     "model_id": 1,
     "year": 2023,
-    "price": 25000,
-    "mileage": 15000,
-    "color_id": 1,
     "body_type_id": 1,
     "fuel_type_id": 1,
     "transmission_type_id": 1,
+    "color_id": 1,
     "condition_id": 2,
-    "description": "Well-maintained car",
-    "location": "New York, NY"
+    "mileage": 15000,
+    "engine_size": 2.0,
+    "price": 25000,
+    "currency": "USD",
+    "title": "2023 Toyota Camry SE",
+    "description": "Well-maintained car with full service history.",
+    "city": "New York",
+    "state": "NY",
+    "country": "USA"
   }'
 ```
 
 
 ### API Endpoints Overview
+
+All endpoints except `/health`, `/ping` and `/swagger` are under `/api/v1`.
 
 | Category | Method | Endpoint | Description | Auth Required |
 |----------|--------|----------|-------------|---------------|
@@ -322,7 +350,7 @@ curl -X POST http://localhost:8080/cars \
 | **Auth** | POST | `/auth/register` | Register new user | No |
 | **Auth** | POST | `/auth/login` | User login | No |
 | **Auth** | POST | `/auth/refresh` | Refresh access token | No |
-| **Auth** | POST | `/auth/logout` | Logout (current device) | Yes |
+| **Auth** | POST | `/auth/logout` | Logout (current device) | No (refresh cookie) |
 | **Auth** | POST | `/auth/logout-all` | Logout (all devices) | Yes |
 | **Auth** | POST | `/auth/change-password` | Change password | Yes |
 | **Auth** | GET | `/auth/profile` | Get user profile | Yes |
@@ -332,6 +360,9 @@ curl -X POST http://localhost:8080/cars \
 | **Cars** | PUT | `/cars/:id` | Update listing | Yes |
 | **Cars** | DELETE | `/cars/:id` | Delete listing | Yes |
 | **Cars** | POST | `/cars/:id/sold` | Mark as sold | Yes |
+| **Cars** | POST | `/cars/:id/images` | Add image | Yes |
+| **Cars** | PUT | `/cars/:id/images/:image_id/primary` | Set primary image | Yes |
+| **Cars** | DELETE | `/cars/:id/images/:image_id` | Delete image | Yes |
 | **Reference** | GET | `/reference/makes` | Get car makes | No |
 | **Reference** | GET | `/reference/makes/:make_id/models` | Get models | No |
 | **Reference** | GET | `/reference/data` | Get all reference data | No |
@@ -473,7 +504,8 @@ Before deploying to production:
 #### Infrastructure Setup
 - [ ] Configure appropriate database path and backup strategy
 - [ ] Set up proper logging and log rotation
-- [ ] Configure CORS allowed origins in middleware
+- [ ] Set `CORS_ALLOWED_ORIGINS` to your frontend origins
+- [ ] Set `TRUSTED_PROXIES` to your reverse proxy address
 - [ ] Set up SSL/TLS certificates (use reverse proxy like nginx)
 - [ ] Configure rate limiting based on expected traffic
 - [ ] Set up monitoring and alerting

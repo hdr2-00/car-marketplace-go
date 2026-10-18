@@ -60,9 +60,6 @@ build-errors.log
 
 # Configuration files with potential secrets
 config.yaml
-*.yaml
-!.github/**/*.yaml
-!.github/**/*.yml
 
 # Backup files
 *.bak

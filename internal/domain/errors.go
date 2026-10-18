@@ -52,6 +52,9 @@ var (
 	ErrCarListingNotOwner      = errors.New("you are not the owner of this listing")
 	ErrCarListingCannotEdit    = errors.New("this listing cannot be edited")
 	ErrCarListingAlreadySold   = errors.New("this car has already been sold")
+	ErrDuplicateVIN            = errors.New("a listing with this VIN already exists")
+	ErrInvalidStatus           = errors.New("invalid listing status")
+	ErrImageNotFound           = errors.New("image not found")
 )
 
 // Reference Data Errors

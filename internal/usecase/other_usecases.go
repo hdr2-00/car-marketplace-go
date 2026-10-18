@@ -74,13 +74,13 @@ func (uc *inquiryUseCase) GetByID(ctx context.Context, id int64, userID int64) (
 func (uc *inquiryUseCase) List(ctx context.Context, filter *domain.InquiryFilter, userID int64) ([]domain.Inquiry, int64, error) {
 	filter.SetDefaults()
 
-	// Ensure user can only see their own inquiries
-	// If neither buyer_id nor seller_id is set, filter by user_id
-	if filter.BuyerID == nil && filter.SellerID == nil {
-		filter.BuyerID = &userID
-		// Also include inquiries where user is the seller
-		// This requires a more complex query, so we'll handle it differently
+	// Users may only see inquiries they sent or received. buyer_id and
+	// seller_id can narrow that to one side, but only to the user's own.
+	if (filter.BuyerID != nil && *filter.BuyerID != userID) ||
+		(filter.SellerID != nil && *filter.SellerID != userID) {
+		return nil, 0, domain.ErrInquiryNotOwner
 	}
+	filter.ParticipantID = &userID
 
 	return uc.inquiryRepo.List(ctx, filter)
 }
@@ -112,11 +112,15 @@ type ReviewUseCase interface {
 
 type reviewUseCase struct {
 	reviewRepo repository.ReviewRepository
+	userRepo   repository.UserRepository
+	carRepo    repository.CarRepository
 }
 
-func NewReviewUseCase(reviewRepo repository.ReviewRepository) ReviewUseCase {
+func NewReviewUseCase(reviewRepo repository.ReviewRepository, userRepo repository.UserRepository, carRepo repository.CarRepository) ReviewUseCase {
 	return &reviewUseCase{
 		reviewRepo: reviewRepo,
+		userRepo:   userRepo,
+		carRepo:    carRepo,
 	}
 }
 
@@ -124,6 +128,22 @@ func (uc *reviewUseCase) Create(ctx context.Context, req *domain.CreateReviewReq
 	// Check if reviewing self
 	if req.ReviewedUserID == reviewerID {
 		return nil, domain.ErrCannotReviewSelf
+	}
+
+	// The reviewed user must exist
+	if _, err := uc.userRepo.GetByID(ctx, req.ReviewedUserID); err != nil {
+		return nil, err
+	}
+
+	// A listing-specific review must be about that listing's seller
+	if req.CarListingID != nil {
+		listing, err := uc.carRepo.GetByID(ctx, *req.CarListingID)
+		if err != nil {
+			return nil, err
+		}
+		if listing.SellerID != req.ReviewedUserID {
+			return nil, domain.ErrInvalidInput
+		}
 	}
 
 	// Check if already reviewed

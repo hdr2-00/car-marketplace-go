@@ -2,6 +2,15 @@ package domain
 
 import "time"
 
+// Listing statuses
+const (
+	ListingStatusActive   = "active"
+	ListingStatusInactive = "inactive"
+	ListingStatusPending  = "pending"
+	ListingStatusSold     = "sold"
+	ListingStatusExpired  = "expired"
+)
+
 // CarListing represents a car listing in the system
 type CarListing struct {
 	ID              int64      `json:"id"`
@@ -136,9 +145,9 @@ type CreateCarListingRequest struct {
 	VIN             string  `json:"vin,omitempty"`
 	Mileage         int     `json:"mileage" binding:"required,min=0"`
 	EngineSize      float64 `json:"engine_size" binding:"required,min=0"`
-	Horsepower      int     `json:"horsepower,omitempty" binding:"min=0"`
-	NumberOfDoors   int     `json:"number_of_doors,omitempty" binding:"min=2,max=6"`
-	SeatingCapacity int     `json:"seating_capacity,omitempty" binding:"min=1,max=20"`
+	Horsepower      int     `json:"horsepower,omitempty" binding:"omitempty,min=0"`
+	NumberOfDoors   int     `json:"number_of_doors,omitempty" binding:"omitempty,min=2,max=6"`
+	SeatingCapacity int     `json:"seating_capacity,omitempty" binding:"omitempty,min=1,max=20"`
 	Price           float64 `json:"price" binding:"required,min=0"`
 	Currency        string  `json:"currency" binding:"required,len=3"`
 	IsNegotiable    bool    `json:"is_negotiable"`
@@ -176,8 +185,10 @@ type UpdateCarListingRequest struct {
 	State           *string  `json:"state,omitempty"`
 	Country         *string  `json:"country,omitempty"`
 	PostalCode      *string  `json:"postal_code,omitempty"`
-	Status          *string  `json:"status,omitempty" binding:"omitempty,oneof=active sold pending expired inactive"`
-	FeatureIDs      []int64  `json:"feature_ids,omitempty"`
+	// Status may only toggle between active and inactive; use the
+	// mark-as-sold endpoint to sell a car.
+	Status     *string `json:"status,omitempty" binding:"omitempty,oneof=active inactive"`
+	FeatureIDs []int64 `json:"feature_ids,omitempty"`
 }
 
 // CarListingFilter represents filters for searching car listings
@@ -227,13 +238,28 @@ func (c *CarListing) IsOwner(userID int64) bool {
 
 // CanEdit checks if the listing can be edited
 func (c *CarListing) CanEdit() bool {
-	return c.Status == "active" || c.Status == "inactive"
+	return c.Status == ListingStatusActive || c.Status == ListingStatusInactive
 }
 
 // MarkAsSold marks the listing as sold
 func (c *CarListing) MarkAsSold() {
-	c.Status = "sold"
+	c.Status = ListingStatusSold
 	now := time.Now()
 	c.SoldAt = &now
 	c.UpdatedAt = now
+}
+
+// AddImageRequest represents a request to add an image to a listing
+type AddImageRequest struct {
+	ImageURL string `json:"image_url" binding:"required,url,max=2048" example:"https://example.com/car.jpg"`
+}
+
+// ReferenceData groups the lookup values used to describe a listing
+type ReferenceData struct {
+	BodyTypes     []BodyType         `json:"body_types"`
+	FuelTypes     []FuelType         `json:"fuel_types"`
+	Transmissions []TransmissionType `json:"transmissions"`
+	Colors        []Color            `json:"colors"`
+	Conditions    []CarCondition     `json:"conditions"`
+	Features      []Feature          `json:"features"`
 }

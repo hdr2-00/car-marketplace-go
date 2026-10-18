@@ -17,6 +17,9 @@ type JWTService interface {
 	ValidateAccessToken(tokenString string) (*domain.AuthClaims, error)
 }
 
+// issuer is set on every access token and required when validating.
+const issuer = "car-marketplace-api"
+
 // jwtService implements JWTService interface
 type jwtService struct {
 	secretKey []byte
@@ -52,7 +55,7 @@ func (s *jwtService) GenerateAccessToken(authClaims *domain.AuthClaims, ttl time
 			ExpiresAt: jwt.NewNumericDate(expiresAt),
 			IssuedAt:  jwt.NewNumericDate(now),
 			NotBefore: jwt.NewNumericDate(now),
-			Issuer:    "car-marketplace-api",
+			Issuer:    issuer,
 			Subject:   authClaims.Email,
 		},
 	}
@@ -80,37 +83,26 @@ func (s *jwtService) GenerateRefreshToken() (string, error) {
 
 // ValidateAccessToken validates and parses a JWT access token
 func (s *jwtService) ValidateAccessToken(tokenString string) (*domain.AuthClaims, error) {
-	// Parse token
-	token, err := jwt.ParseWithClaims(tokenString, &JWTClaims{}, func(token *jwt.Token) (interface{}, error) {
-		// Verify signing method
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, errors.New("unexpected signing method")
-		}
+	claims := &JWTClaims{}
+	_, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) {
 		return s.secretKey, nil
-	})
+	},
+		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
+		jwt.WithIssuer(issuer),
+		jwt.WithExpirationRequired(),
+	)
 
 	if err != nil {
+		if errors.Is(err, jwt.ErrTokenExpired) {
+			return nil, domain.ErrTokenExpired
+		}
 		return nil, domain.ErrInvalidToken
 	}
 
-	// Extract and validate claims
-	claims, ok := token.Claims.(*JWTClaims)
-	if !ok || !token.Valid {
-		return nil, domain.ErrInvalidToken
-	}
-
-	// Check expiration
-	if claims.ExpiresAt != nil && claims.ExpiresAt.Before(time.Now()) {
-		return nil, domain.ErrTokenExpired
-	}
-
-	// Convert to domain claims
-	authClaims := &domain.AuthClaims{
+	return &domain.AuthClaims{
 		UserID:   claims.UserID,
 		Email:    claims.Email,
 		UserType: claims.UserType,
 		Role:     claims.Role,
-	}
-
-	return authClaims, nil
+	}, nil
 }

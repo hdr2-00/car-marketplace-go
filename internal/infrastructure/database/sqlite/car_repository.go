@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode"
 )
 
 // carRepository implements repository.CarRepository
@@ -22,6 +23,42 @@ func NewCarRepository(db *sql.DB) repository.CarRepository {
 
 // ================= CAR LISTING CRUD =================
 
+const listingColumns = `
+	id, seller_id, make_id, model_id, year, body_type_id, fuel_type_id,
+	transmission_type_id, color_id, condition_id, COALESCE(vin, ''), mileage, engine_size,
+	COALESCE(horsepower, 0), COALESCE(number_of_doors, 0), COALESCE(seating_capacity, 0),
+	price, currency, is_negotiable,
+	title, description, city, state, country, COALESCE(postal_code, ''), status, is_featured,
+	views_count, created_at, updated_at, expires_at, sold_at`
+
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanListing(row rowScanner, listing *domain.CarListing) error {
+	return row.Scan(
+		&listing.ID, &listing.SellerID, &listing.MakeID, &listing.ModelID, &listing.Year,
+		&listing.BodyTypeID, &listing.FuelTypeID, &listing.TransmissionID, &listing.ColorID,
+		&listing.ConditionID, &listing.VIN, &listing.Mileage, &listing.EngineSize,
+		&listing.Horsepower, &listing.NumberOfDoors, &listing.SeatingCapacity, &listing.Price,
+		&listing.Currency, &listing.IsNegotiable, &listing.Title, &listing.Description,
+		&listing.City, &listing.State, &listing.Country, &listing.PostalCode, &listing.Status,
+		&listing.IsFeatured, &listing.ViewsCount, &listing.CreatedAt, &listing.UpdatedAt,
+		&listing.ExpiresAt, &listing.SoldAt,
+	)
+}
+
+// mapListingWriteError converts constraint failures into domain errors.
+func mapListingWriteError(err error) error {
+	switch {
+	case isUniqueViolation(err, "car_listings.vin"):
+		return domain.ErrDuplicateVIN
+	case isForeignKeyViolation(err):
+		return domain.ErrInvalidInput
+	}
+	return err
+}
+
 // Create creates a new car listing
 func (r *carRepository) Create(ctx context.Context, listing *domain.CarListing) error {
 	query := `
@@ -34,10 +71,10 @@ func (r *carRepository) Create(ctx context.Context, listing *domain.CarListing) 
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 
-	result, err := r.db.ExecContext(ctx, query,
+	result, err := conn(ctx, r.db).ExecContext(ctx, query,
 		listing.SellerID, listing.MakeID, listing.ModelID, listing.Year, listing.BodyTypeID,
 		listing.FuelTypeID, listing.TransmissionID, listing.ColorID, listing.ConditionID,
-		listing.VIN, listing.Mileage, listing.EngineSize, listing.Horsepower,
+		nullString(listing.VIN), listing.Mileage, listing.EngineSize, listing.Horsepower,
 		listing.NumberOfDoors, listing.SeatingCapacity, listing.Price, listing.Currency,
 		listing.IsNegotiable, listing.Title, listing.Description, listing.City, listing.State,
 		listing.Country, listing.PostalCode, listing.Status, listing.IsFeatured,
@@ -45,6 +82,9 @@ func (r *carRepository) Create(ctx context.Context, listing *domain.CarListing) 
 	)
 
 	if err != nil {
+		if mapped := mapListingWriteError(err); mapped != err {
+			return mapped
+		}
 		return fmt.Errorf("failed to create car listing: %w", err)
 	}
 
@@ -59,33 +99,12 @@ func (r *carRepository) Create(ctx context.Context, listing *domain.CarListing) 
 
 // GetByID retrieves a car listing by ID
 func (r *carRepository) GetByID(ctx context.Context, id int64) (*domain.CarListing, error) {
-	query := `
-		SELECT
-			id, seller_id, make_id, model_id, year, body_type_id, fuel_type_id,
-			transmission_type_id, color_id, condition_id, COALESCE(vin, ''), mileage, engine_size,
-			COALESCE(horsepower, 0), COALESCE(number_of_doors, 0), COALESCE(seating_capacity, 0),
-			price, currency, is_negotiable,
-			title, description, city, state, country, COALESCE(postal_code, ''), status, is_featured,
-			views_count, created_at, updated_at, expires_at, sold_at
-		FROM car_listings
-		WHERE id = ?
-	`
+	query := `SELECT ` + listingColumns + ` FROM car_listings WHERE id = ?`
 
 	listing := &domain.CarListing{}
-	err := r.db.QueryRowContext(ctx, query, id).Scan(
-		&listing.ID, &listing.SellerID, &listing.MakeID, &listing.ModelID, &listing.Year,
-		&listing.BodyTypeID, &listing.FuelTypeID, &listing.TransmissionID, &listing.ColorID,
-		&listing.ConditionID, &listing.VIN, &listing.Mileage, &listing.EngineSize,
-		&listing.Horsepower, &listing.NumberOfDoors, &listing.SeatingCapacity, &listing.Price,
-		&listing.Currency, &listing.IsNegotiable, &listing.Title, &listing.Description,
-		&listing.City, &listing.State, &listing.Country, &listing.PostalCode, &listing.Status,
-		&listing.IsFeatured, &listing.ViewsCount, &listing.CreatedAt, &listing.UpdatedAt,
-		&listing.ExpiresAt, &listing.SoldAt,
-	)
-
-	if err != nil {
+	if err := scanListing(conn(ctx, r.db).QueryRowContext(ctx, query, id), listing); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, domain.ErrNotFound
+			return nil, domain.ErrCarListingNotFound
 		}
 		return nil, fmt.Errorf("failed to get car listing: %w", err)
 	}
@@ -106,9 +125,9 @@ func (r *carRepository) Update(ctx context.Context, listing *domain.CarListing) 
 		WHERE id = ?
 	`
 
-	result, err := r.db.ExecContext(ctx, query,
+	result, err := conn(ctx, r.db).ExecContext(ctx, query,
 		listing.MakeID, listing.ModelID, listing.Year, listing.BodyTypeID, listing.FuelTypeID,
-		listing.TransmissionID, listing.ColorID, listing.ConditionID, listing.VIN, listing.Mileage,
+		listing.TransmissionID, listing.ColorID, listing.ConditionID, nullString(listing.VIN), listing.Mileage,
 		listing.EngineSize, listing.Horsepower, listing.NumberOfDoors, listing.SeatingCapacity,
 		listing.Price, listing.Currency, listing.IsNegotiable, listing.Title, listing.Description,
 		listing.City, listing.State, listing.Country, listing.PostalCode, listing.Status,
@@ -116,6 +135,9 @@ func (r *carRepository) Update(ctx context.Context, listing *domain.CarListing) 
 	)
 
 	if err != nil {
+		if mapped := mapListingWriteError(err); mapped != err {
+			return mapped
+		}
 		return fmt.Errorf("failed to update car listing: %w", err)
 	}
 
@@ -125,7 +147,7 @@ func (r *carRepository) Update(ctx context.Context, listing *domain.CarListing) 
 	}
 
 	if rowsAffected == 0 {
-		return domain.ErrNotFound
+		return domain.ErrCarListingNotFound
 	}
 
 	return nil
@@ -135,7 +157,7 @@ func (r *carRepository) Update(ctx context.Context, listing *domain.CarListing) 
 func (r *carRepository) Delete(ctx context.Context, id int64) error {
 	query := `DELETE FROM car_listings WHERE id = ?`
 
-	result, err := r.db.ExecContext(ctx, query, id)
+	result, err := conn(ctx, r.db).ExecContext(ctx, query, id)
 	if err != nil {
 		return fmt.Errorf("failed to delete car listing: %w", err)
 	}
@@ -146,10 +168,25 @@ func (r *carRepository) Delete(ctx context.Context, id int64) error {
 	}
 
 	if rowsAffected == 0 {
-		return domain.ErrNotFound
+		return domain.ErrCarListingNotFound
 	}
 
 	return nil
+}
+
+// ftsQuery turns free text into a safe FTS5 query: each word becomes a quoted
+// prefix term ("word"*), and all terms must match. Punctuation and FTS
+// operators in the input are dropped, so user input can't break the syntax.
+func ftsQuery(search string) string {
+	words := strings.FieldsFunc(search, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
+
+	terms := make([]string, 0, len(words))
+	for _, w := range words {
+		terms = append(terms, `"`+w+`"*`)
+	}
+	return strings.Join(terms, " ")
 }
 
 // List retrieves car listings based on filter criteria
@@ -163,86 +200,73 @@ func (r *carRepository) List(ctx context.Context, filter *domain.CarListingFilte
 	where := []string{"1=1"}
 	args := []interface{}{}
 
+	add := func(cond string, arg any) {
+		where = append(where, cond)
+		args = append(args, arg)
+	}
+
 	if filter.MakeID != nil {
-		where = append(where, "make_id = ?")
-		args = append(args, *filter.MakeID)
+		add("make_id = ?", *filter.MakeID)
 	}
 	if filter.ModelID != nil {
-		where = append(where, "model_id = ?")
-		args = append(args, *filter.ModelID)
+		add("model_id = ?", *filter.ModelID)
 	}
 	if filter.MinYear != nil {
-		where = append(where, "year >= ?")
-		args = append(args, *filter.MinYear)
+		add("year >= ?", *filter.MinYear)
 	}
 	if filter.MaxYear != nil {
-		where = append(where, "year <= ?")
-		args = append(args, *filter.MaxYear)
+		add("year <= ?", *filter.MaxYear)
 	}
 	if filter.BodyTypeID != nil {
-		where = append(where, "body_type_id = ?")
-		args = append(args, *filter.BodyTypeID)
+		add("body_type_id = ?", *filter.BodyTypeID)
 	}
 	if filter.FuelTypeID != nil {
-		where = append(where, "fuel_type_id = ?")
-		args = append(args, *filter.FuelTypeID)
+		add("fuel_type_id = ?", *filter.FuelTypeID)
 	}
 	if filter.TransmissionID != nil {
-		where = append(where, "transmission_type_id = ?")
-		args = append(args, *filter.TransmissionID)
+		add("transmission_type_id = ?", *filter.TransmissionID)
 	}
 	if filter.ColorID != nil {
-		where = append(where, "color_id = ?")
-		args = append(args, *filter.ColorID)
+		add("color_id = ?", *filter.ColorID)
 	}
 	if filter.ConditionID != nil {
-		where = append(where, "condition_id = ?")
-		args = append(args, *filter.ConditionID)
+		add("condition_id = ?", *filter.ConditionID)
 	}
 	if filter.MinPrice != nil {
-		where = append(where, "price >= ?")
-		args = append(args, *filter.MinPrice)
+		add("price >= ?", *filter.MinPrice)
 	}
 	if filter.MaxPrice != nil {
-		where = append(where, "price <= ?")
-		args = append(args, *filter.MaxPrice)
+		add("price <= ?", *filter.MaxPrice)
 	}
 	if filter.MinMileage != nil {
-		where = append(where, "mileage >= ?")
-		args = append(args, *filter.MinMileage)
+		add("mileage >= ?", *filter.MinMileage)
 	}
 	if filter.MaxMileage != nil {
-		where = append(where, "mileage <= ?")
-		args = append(args, *filter.MaxMileage)
+		add("mileage <= ?", *filter.MaxMileage)
 	}
+	// COLLATE NOCASE matches idx_car_listings_location, so these use the index.
 	if filter.City != nil {
-		where = append(where, "LOWER(city) = LOWER(?)")
-		args = append(args, *filter.City)
+		add("city = ? COLLATE NOCASE", *filter.City)
 	}
 	if filter.State != nil {
-		where = append(where, "LOWER(state) = LOWER(?)")
-		args = append(args, *filter.State)
+		add("state = ? COLLATE NOCASE", *filter.State)
 	}
 	if filter.Country != nil {
-		where = append(where, "LOWER(country) = LOWER(?)")
-		args = append(args, *filter.Country)
+		add("country = ? COLLATE NOCASE", *filter.Country)
 	}
 	if filter.Status != nil {
-		where = append(where, "status = ?")
-		args = append(args, *filter.Status)
+		add("status = ?", *filter.Status)
 	}
 	if filter.SellerID != nil {
-		where = append(where, "seller_id = ?")
-		args = append(args, *filter.SellerID)
+		add("seller_id = ?", *filter.SellerID)
 	}
 	if filter.IsFeatured != nil {
-		where = append(where, "is_featured = ?")
-		args = append(args, *filter.IsFeatured)
+		add("is_featured = ?", *filter.IsFeatured)
 	}
-	if filter.Search != nil && *filter.Search != "" {
-		where = append(where, "(LOWER(title) LIKE LOWER(?) OR LOWER(description) LIKE LOWER(?))")
-		searchTerm := "%" + *filter.Search + "%"
-		args = append(args, searchTerm, searchTerm)
+	if filter.Search != nil {
+		if q := ftsQuery(*filter.Search); q != "" {
+			add("id IN (SELECT rowid FROM car_listings_fts WHERE car_listings_fts MATCH ?)", q)
+		}
 	}
 
 	whereClause := strings.Join(where, " AND ")
@@ -250,71 +274,51 @@ func (r *carRepository) List(ctx context.Context, filter *domain.CarListingFilte
 	// Count total
 	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM car_listings WHERE %s", whereClause)
 	var total int64
-	err := r.db.QueryRowContext(ctx, countQuery, args...).Scan(&total)
+	err := conn(ctx, r.db).QueryRowContext(ctx, countQuery, args...).Scan(&total)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to count car listings: %w", err)
 	}
 
-	// Build ORDER BY clause
-	orderBy := "created_at DESC"
+	listings := []domain.CarListing{}
+	if total == 0 {
+		return listings, 0, nil
+	}
+
+	// Build ORDER BY clause; id breaks ties so pages don't overlap.
+	orderBy := "created_at DESC, id DESC"
 	switch filter.SortBy {
 	case "price_asc":
-		orderBy = "price ASC"
+		orderBy = "price ASC, id ASC"
 	case "price_desc":
-		orderBy = "price DESC"
+		orderBy = "price DESC, id DESC"
 	case "year_asc":
-		orderBy = "year ASC"
+		orderBy = "year ASC, id ASC"
 	case "year_desc":
-		orderBy = "year DESC"
+		orderBy = "year DESC, id DESC"
 	case "mileage_asc":
-		orderBy = "mileage ASC"
+		orderBy = "mileage ASC, id ASC"
 	case "mileage_desc":
-		orderBy = "mileage DESC"
+		orderBy = "mileage DESC, id DESC"
 	case "created_asc":
-		orderBy = "created_at ASC"
-	case "created_desc":
-		orderBy = "created_at DESC"
+		orderBy = "created_at ASC, id ASC"
 	}
 
 	// Build pagination
 	offset := (filter.Page - 1) * filter.Limit
 	args = append(args, filter.Limit, offset)
 
-	// Get listings
-	query := fmt.Sprintf(`
-		SELECT
-			id, seller_id, make_id, model_id, year, body_type_id, fuel_type_id,
-			transmission_type_id, color_id, condition_id, COALESCE(vin, ''), mileage, engine_size,
-			COALESCE(horsepower, 0), COALESCE(number_of_doors, 0), COALESCE(seating_capacity, 0),
-			price, currency, is_negotiable,
-			title, description, city, state, country, COALESCE(postal_code, ''), status, is_featured,
-			views_count, created_at, updated_at, expires_at, sold_at
-		FROM car_listings
-		WHERE %s
-		ORDER BY %s
-		LIMIT ? OFFSET ?
-	`, whereClause, orderBy)
+	query := fmt.Sprintf(`SELECT %s FROM car_listings WHERE %s ORDER BY %s LIMIT ? OFFSET ?`,
+		listingColumns, whereClause, orderBy)
 
-	rows, err := r.db.QueryContext(ctx, query, args...)
+	rows, err := conn(ctx, r.db).QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to list car listings: %w", err)
 	}
 	defer rows.Close()
 
-	listings := []domain.CarListing{}
 	for rows.Next() {
 		var listing domain.CarListing
-		err := rows.Scan(
-			&listing.ID, &listing.SellerID, &listing.MakeID, &listing.ModelID, &listing.Year,
-			&listing.BodyTypeID, &listing.FuelTypeID, &listing.TransmissionID, &listing.ColorID,
-			&listing.ConditionID, &listing.VIN, &listing.Mileage, &listing.EngineSize,
-			&listing.Horsepower, &listing.NumberOfDoors, &listing.SeatingCapacity, &listing.Price,
-			&listing.Currency, &listing.IsNegotiable, &listing.Title, &listing.Description,
-			&listing.City, &listing.State, &listing.Country, &listing.PostalCode, &listing.Status,
-			&listing.IsFeatured, &listing.ViewsCount, &listing.CreatedAt, &listing.UpdatedAt,
-			&listing.ExpiresAt, &listing.SoldAt,
-		)
-		if err != nil {
+		if err := scanListing(rows, &listing); err != nil {
 			return nil, 0, fmt.Errorf("failed to scan car listing: %w", err)
 		}
 		listings = append(listings, listing)
@@ -327,520 +331,227 @@ func (r *carRepository) List(ctx context.Context, filter *domain.CarListingFilte
 	return listings, total, nil
 }
 
-// IncrementViews increments the view count for a car listing
-func (r *carRepository) IncrementViews(ctx context.Context, id int64) error {
-	query := `UPDATE car_listings SET views_count = views_count + 1 WHERE id = ?`
-
-	result, err := r.db.ExecContext(ctx, query, id)
-	if err != nil {
-		return fmt.Errorf("failed to increment views: %w", err)
+// IncrementViews adds buffered view counts to their listings in one transaction.
+func (r *carRepository) IncrementViews(ctx context.Context, counts map[int64]int) error {
+	if len(counts) == 0 {
+		return nil
 	}
 
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("failed to get rows affected: %w", err)
-	}
-
-	if rowsAffected == 0 {
-		return domain.ErrNotFound
-	}
-
-	return nil
+	return withTx(ctx, r.db, func(ctx context.Context, q querier) error {
+		for id, n := range counts {
+			if _, err := q.ExecContext(ctx, `UPDATE car_listings SET views_count = views_count + ? WHERE id = ?`, n, id); err != nil {
+				return fmt.Errorf("failed to increment views: %w", err)
+			}
+		}
+		return nil
+	})
 }
 
-// ================= CAR MAKE OPERATIONS =================
+// ================= REFERENCE DATA =================
 
-func (r *carRepository) GetMakeByID(ctx context.Context, id int64) (*domain.CarMake, error) {
-	query := `SELECT id, name, COALESCE(logo_url, ''), COALESCE(country_of_origin, ''), created_at, updated_at FROM car_makes WHERE id = ?`
-
-	make := &domain.CarMake{}
-	err := r.db.QueryRowContext(ctx, query, id).Scan(
-		&make.ID, &make.Name, &make.LogoURL, &make.CountryOfOrigin, &make.CreatedAt, &make.UpdatedAt,
-	)
-
+// queryAll runs query and scans each row with scan, collecting the results.
+func queryAll[T any](ctx context.Context, q querier, query string, scan func(rowScanner, *T) error, args ...any) ([]T, error) {
+	rows, err := q.QueryContext(ctx, query, args...)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, domain.ErrInvalidMake
-		}
 		return nil, err
 	}
+	defer rows.Close()
 
-	return make, nil
+	items := []T{}
+	for rows.Next() {
+		var item T
+		if err := scan(rows, &item); err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+
+	return items, rows.Err()
 }
 
 func (r *carRepository) GetAllMakes(ctx context.Context) ([]domain.CarMake, error) {
-	query := `SELECT id, name, COALESCE(logo_url, ''), COALESCE(country_of_origin, ''), created_at, updated_at FROM car_makes ORDER BY name ASC`
-
-	rows, err := r.db.QueryContext(ctx, query)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var makes []domain.CarMake
-	for rows.Next() {
-		var make domain.CarMake
-		err := rows.Scan(&make.ID, &make.Name, &make.LogoURL, &make.CountryOfOrigin, &make.CreatedAt, &make.UpdatedAt)
-		if err != nil {
-			return nil, err
-		}
-		makes = append(makes, make)
-	}
-
-	return makes, nil
+	return queryAll(ctx, conn(ctx, r.db),
+		`SELECT id, name, COALESCE(logo_url, ''), COALESCE(country_of_origin, ''), created_at, updated_at FROM car_makes ORDER BY name ASC`,
+		func(row rowScanner, m *domain.CarMake) error {
+			return row.Scan(&m.ID, &m.Name, &m.LogoURL, &m.CountryOfOrigin, &m.CreatedAt, &m.UpdatedAt)
+		})
 }
 
-// ================= CAR MODEL OPERATIONS =================
-
-func (r *carRepository) GetModelByID(ctx context.Context, id int64) (*domain.CarModel, error) {
-	query := `SELECT id, make_id, name, created_at, updated_at FROM car_models WHERE id = ?`
-
-	model := &domain.CarModel{}
-	err := r.db.QueryRowContext(ctx, query, id).Scan(
-		&model.ID, &model.MakeID, &model.Name, &model.CreatedAt, &model.UpdatedAt,
-	)
-
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, domain.ErrInvalidModel
-		}
-		return nil, err
-	}
-
-	return model, nil
-}
-
-func (r *carRepository) GetModelsByMakeID(ctx context.Context, makeID int64) ([]domain.CarModel, error) {
-	query := `SELECT id, make_id, name, created_at, updated_at FROM car_models WHERE make_id = ? ORDER BY name ASC`
-
-	rows, err := r.db.QueryContext(ctx, query, makeID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var models []domain.CarModel
-	for rows.Next() {
-		var model domain.CarModel
-		err := rows.Scan(&model.ID, &model.MakeID, &model.Name, &model.CreatedAt, &model.UpdatedAt)
-		if err != nil {
-			return nil, err
-		}
-		models = append(models, model)
-	}
-
-	return models, nil
-}
-
-// ================= BODY TYPE OPERATIONS =================
-
-func (r *carRepository) GetBodyTypeByID(ctx context.Context, id int64) (*domain.BodyType, error) {
-	query := `SELECT id, name, created_at FROM body_types WHERE id = ?`
-
-	bodyType := &domain.BodyType{}
-	err := r.db.QueryRowContext(ctx, query, id).Scan(&bodyType.ID, &bodyType.Name, &bodyType.CreatedAt)
-
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, domain.ErrInvalidBodyType
-		}
-		return nil, err
-	}
-
-	return bodyType, nil
+func (r *carRepository) GetAllModels(ctx context.Context) ([]domain.CarModel, error) {
+	return queryAll(ctx, conn(ctx, r.db),
+		`SELECT id, make_id, name, created_at, updated_at FROM car_models ORDER BY name ASC`,
+		func(row rowScanner, m *domain.CarModel) error {
+			return row.Scan(&m.ID, &m.MakeID, &m.Name, &m.CreatedAt, &m.UpdatedAt)
+		})
 }
 
 func (r *carRepository) GetAllBodyTypes(ctx context.Context) ([]domain.BodyType, error) {
-	query := `SELECT id, name, created_at FROM body_types ORDER BY name ASC`
-
-	rows, err := r.db.QueryContext(ctx, query)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var bodyTypes []domain.BodyType
-	for rows.Next() {
-		var bt domain.BodyType
-		err := rows.Scan(&bt.ID, &bt.Name, &bt.CreatedAt)
-		if err != nil {
-			return nil, err
-		}
-		bodyTypes = append(bodyTypes, bt)
-	}
-
-	return bodyTypes, nil
-}
-
-// ================= FUEL TYPE OPERATIONS =================
-
-func (r *carRepository) GetFuelTypeByID(ctx context.Context, id int64) (*domain.FuelType, error) {
-	query := `SELECT id, name, created_at FROM fuel_types WHERE id = ?`
-
-	fuelType := &domain.FuelType{}
-	err := r.db.QueryRowContext(ctx, query, id).Scan(&fuelType.ID, &fuelType.Name, &fuelType.CreatedAt)
-
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, domain.ErrInvalidFuelType
-		}
-		return nil, err
-	}
-
-	return fuelType, nil
+	return queryAll(ctx, conn(ctx, r.db), `SELECT id, name, created_at FROM body_types ORDER BY name ASC`,
+		func(row rowScanner, b *domain.BodyType) error { return row.Scan(&b.ID, &b.Name, &b.CreatedAt) })
 }
 
 func (r *carRepository) GetAllFuelTypes(ctx context.Context) ([]domain.FuelType, error) {
-	query := `SELECT id, name, created_at FROM fuel_types ORDER BY name ASC`
-
-	rows, err := r.db.QueryContext(ctx, query)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var fuelTypes []domain.FuelType
-	for rows.Next() {
-		var ft domain.FuelType
-		err := rows.Scan(&ft.ID, &ft.Name, &ft.CreatedAt)
-		if err != nil {
-			return nil, err
-		}
-		fuelTypes = append(fuelTypes, ft)
-	}
-
-	return fuelTypes, nil
-}
-
-// ================= TRANSMISSION OPERATIONS =================
-
-func (r *carRepository) GetTransmissionByID(ctx context.Context, id int64) (*domain.TransmissionType, error) {
-	query := `SELECT id, name, created_at FROM transmission_types WHERE id = ?`
-
-	transmission := &domain.TransmissionType{}
-	err := r.db.QueryRowContext(ctx, query, id).Scan(&transmission.ID, &transmission.Name, &transmission.CreatedAt)
-
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, domain.ErrInvalidTransmission
-		}
-		return nil, err
-	}
-
-	return transmission, nil
+	return queryAll(ctx, conn(ctx, r.db), `SELECT id, name, created_at FROM fuel_types ORDER BY name ASC`,
+		func(row rowScanner, f *domain.FuelType) error { return row.Scan(&f.ID, &f.Name, &f.CreatedAt) })
 }
 
 func (r *carRepository) GetAllTransmissions(ctx context.Context) ([]domain.TransmissionType, error) {
-	query := `SELECT id, name, created_at FROM transmission_types ORDER BY name ASC`
-
-	rows, err := r.db.QueryContext(ctx, query)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var transmissions []domain.TransmissionType
-	for rows.Next() {
-		var t domain.TransmissionType
-		err := rows.Scan(&t.ID, &t.Name, &t.CreatedAt)
-		if err != nil {
-			return nil, err
-		}
-		transmissions = append(transmissions, t)
-	}
-
-	return transmissions, nil
-}
-
-// ================= COLOR OPERATIONS =================
-
-func (r *carRepository) GetColorByID(ctx context.Context, id int64) (*domain.Color, error) {
-	query := `SELECT id, name, COALESCE(hex_code, ''), created_at FROM colors WHERE id = ?`
-
-	color := &domain.Color{}
-	err := r.db.QueryRowContext(ctx, query, id).Scan(&color.ID, &color.Name, &color.HexCode, &color.CreatedAt)
-
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, domain.ErrInvalidColor
-		}
-		return nil, err
-	}
-
-	return color, nil
+	return queryAll(ctx, conn(ctx, r.db), `SELECT id, name, created_at FROM transmission_types ORDER BY name ASC`,
+		func(row rowScanner, t *domain.TransmissionType) error { return row.Scan(&t.ID, &t.Name, &t.CreatedAt) })
 }
 
 func (r *carRepository) GetAllColors(ctx context.Context) ([]domain.Color, error) {
-	query := `SELECT id, name, COALESCE(hex_code, ''), created_at FROM colors ORDER BY name ASC`
-
-	rows, err := r.db.QueryContext(ctx, query)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var colors []domain.Color
-	for rows.Next() {
-		var c domain.Color
-		err := rows.Scan(&c.ID, &c.Name, &c.HexCode, &c.CreatedAt)
-		if err != nil {
-			return nil, err
-		}
-		colors = append(colors, c)
-	}
-
-	return colors, nil
-}
-
-// ================= CONDITION OPERATIONS =================
-
-func (r *carRepository) GetConditionByID(ctx context.Context, id int64) (*domain.CarCondition, error) {
-	query := `SELECT id, name, created_at FROM car_conditions WHERE id = ?`
-
-	condition := &domain.CarCondition{}
-	err := r.db.QueryRowContext(ctx, query, id).Scan(&condition.ID, &condition.Name, &condition.CreatedAt)
-
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, domain.ErrInvalidCondition
-		}
-		return nil, err
-	}
-
-	return condition, nil
+	return queryAll(ctx, conn(ctx, r.db), `SELECT id, name, COALESCE(hex_code, ''), created_at FROM colors ORDER BY name ASC`,
+		func(row rowScanner, c *domain.Color) error { return row.Scan(&c.ID, &c.Name, &c.HexCode, &c.CreatedAt) })
 }
 
 func (r *carRepository) GetAllConditions(ctx context.Context) ([]domain.CarCondition, error) {
-	query := `SELECT id, name, created_at FROM car_conditions ORDER BY name ASC`
+	return queryAll(ctx, conn(ctx, r.db), `SELECT id, name, created_at FROM car_conditions ORDER BY name ASC`,
+		func(row rowScanner, c *domain.CarCondition) error { return row.Scan(&c.ID, &c.Name, &c.CreatedAt) })
+}
 
-	rows, err := r.db.QueryContext(ctx, query)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
+func scanFeature(row rowScanner, f *domain.Feature) error {
+	return row.Scan(&f.ID, &f.Name, &f.Category, &f.CreatedAt)
+}
 
-	var conditions []domain.CarCondition
-	for rows.Next() {
-		var c domain.CarCondition
-		err := rows.Scan(&c.ID, &c.Name, &c.CreatedAt)
-		if err != nil {
-			return nil, err
-		}
-		conditions = append(conditions, c)
-	}
-
-	return conditions, nil
+func (r *carRepository) GetAllFeatures(ctx context.Context) ([]domain.Feature, error) {
+	return queryAll(ctx, conn(ctx, r.db),
+		`SELECT id, name, COALESCE(category, ''), created_at FROM features ORDER BY category, name ASC`, scanFeature)
 }
 
 // ================= FEATURE OPERATIONS =================
 
-func (r *carRepository) GetFeatureByID(ctx context.Context, id int64) (*domain.Feature, error) {
-	query := `SELECT id, name, COALESCE(category, ''), created_at FROM features WHERE id = ?`
-
-	feature := &domain.Feature{}
-	err := r.db.QueryRowContext(ctx, query, id).Scan(&feature.ID, &feature.Name, &feature.Category, &feature.CreatedAt)
-
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, domain.ErrInvalidFeature
-		}
-		return nil, err
-	}
-
-	return feature, nil
-}
-
-func (r *carRepository) GetAllFeatures(ctx context.Context) ([]domain.Feature, error) {
-	query := `SELECT id, name, COALESCE(category, ''), created_at FROM features ORDER BY category, name ASC`
-
-	rows, err := r.db.QueryContext(ctx, query)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var features []domain.Feature
-	for rows.Next() {
-		var f domain.Feature
-		err := rows.Scan(&f.ID, &f.Name, &f.Category, &f.CreatedAt)
-		if err != nil {
-			return nil, err
-		}
-		features = append(features, f)
-	}
-
-	return features, nil
-}
-
-func (r *carRepository) GetFeaturesByCategory(ctx context.Context, category string) ([]domain.Feature, error) {
-	query := `SELECT id, name, COALESCE(category, ''), created_at FROM features WHERE category = ? ORDER BY name ASC`
-
-	rows, err := r.db.QueryContext(ctx, query, category)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var features []domain.Feature
-	for rows.Next() {
-		var f domain.Feature
-		err := rows.Scan(&f.ID, &f.Name, &f.Category, &f.CreatedAt)
-		if err != nil {
-			return nil, err
-		}
-		features = append(features, f)
-	}
-
-	return features, nil
-}
-
-func (r *carRepository) AddFeaturesToListing(ctx context.Context, listingID int64, featureIDs []int64) error {
-	if len(featureIDs) == 0 {
-		return nil
-	}
-
-	tx, err := r.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	stmt, err := tx.PrepareContext(ctx, `INSERT INTO car_listing_features (car_listing_id, feature_id, created_at) VALUES (?, ?, datetime('now'))`)
-	if err != nil {
-		return err
-	}
-	defer stmt.Close()
-
-	for _, featureID := range featureIDs {
-		if _, err := stmt.ExecContext(ctx, listingID, featureID); err != nil {
+// ReplaceListingFeatures sets a listing's features to exactly featureIDs.
+func (r *carRepository) ReplaceListingFeatures(ctx context.Context, listingID int64, featureIDs []int64) error {
+	return withTx(ctx, r.db, func(ctx context.Context, q querier) error {
+		if _, err := q.ExecContext(ctx, `DELETE FROM car_listing_features WHERE car_listing_id = ?`, listingID); err != nil {
 			return err
 		}
-	}
 
-	return tx.Commit()
-}
-
-func (r *carRepository) RemoveAllFeaturesFromListing(ctx context.Context, listingID int64) error {
-	query := `DELETE FROM car_listing_features WHERE car_listing_id = ?`
-	_, err := r.db.ExecContext(ctx, query, listingID)
-	return err
+		for _, featureID := range featureIDs {
+			_, err := q.ExecContext(ctx,
+				`INSERT OR IGNORE INTO car_listing_features (car_listing_id, feature_id, created_at) VALUES (?, ?, datetime('now'))`,
+				listingID, featureID)
+			if err != nil {
+				if isForeignKeyViolation(err) {
+					return domain.ErrInvalidFeature
+				}
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 func (r *carRepository) GetListingFeatures(ctx context.Context, listingID int64) ([]domain.Feature, error) {
-	query := `
+	return queryAll(ctx, conn(ctx, r.db), `
 		SELECT f.id, f.name, COALESCE(f.category, ''), f.created_at
 		FROM features f
 		INNER JOIN car_listing_features clf ON f.id = clf.feature_id
 		WHERE clf.car_listing_id = ?
 		ORDER BY f.category, f.name ASC
-	`
-
-	rows, err := r.db.QueryContext(ctx, query, listingID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var features []domain.Feature
-	for rows.Next() {
-		var f domain.Feature
-		err := rows.Scan(&f.ID, &f.Name, &f.Category, &f.CreatedAt)
-		if err != nil {
-			return nil, err
-		}
-		features = append(features, f)
-	}
-
-	return features, nil
+	`, scanFeature, listingID)
 }
 
 // ================= IMAGE OPERATIONS =================
 
+const imageColumns = `id, car_listing_id, image_url, display_order, is_primary, created_at`
+
+func scanImage(row rowScanner, img *domain.CarImage) error {
+	return row.Scan(&img.ID, &img.CarListingID, &img.ImageURL, &img.DisplayOrder, &img.IsPrimary, &img.CreatedAt)
+}
+
+// CreateImage appends an image to its listing. The display order is set after
+// the listing's last image, and the first image becomes the primary one.
 func (r *carRepository) CreateImage(ctx context.Context, image *domain.CarImage) error {
-	query := `
-		INSERT INTO car_images (car_listing_id, image_url, display_order, is_primary, created_at)
-		VALUES (?, ?, ?, ?, ?)
-	`
+	return withTx(ctx, r.db, func(ctx context.Context, q querier) error {
+		var count int
+		err := q.QueryRowContext(ctx,
+			`SELECT COALESCE(MAX(display_order) + 1, 0), COUNT(*) FROM car_images WHERE car_listing_id = ?`,
+			image.CarListingID,
+		).Scan(&image.DisplayOrder, &count)
+		if err != nil {
+			return err
+		}
+		image.IsPrimary = count == 0
 
-	result, err := r.db.ExecContext(ctx, query,
-		image.CarListingID, image.ImageURL, image.DisplayOrder, image.IsPrimary, image.CreatedAt,
-	)
+		result, err := q.ExecContext(ctx, `
+			INSERT INTO car_images (car_listing_id, image_url, display_order, is_primary, created_at)
+			VALUES (?, ?, ?, ?, ?)`,
+			image.CarListingID, image.ImageURL, image.DisplayOrder, image.IsPrimary, image.CreatedAt,
+		)
+		if err != nil {
+			if isForeignKeyViolation(err) {
+				return domain.ErrCarListingNotFound
+			}
+			return err
+		}
 
-	if err != nil {
+		image.ID, err = result.LastInsertId()
 		return err
-	}
+	})
+}
 
-	id, err := result.LastInsertId()
+func (r *carRepository) GetImageByID(ctx context.Context, id int64) (*domain.CarImage, error) {
+	img := &domain.CarImage{}
+	err := scanImage(conn(ctx, r.db).QueryRowContext(ctx, `SELECT `+imageColumns+` FROM car_images WHERE id = ?`, id), img)
 	if err != nil {
-		return err
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, domain.ErrImageNotFound
+		}
+		return nil, err
 	}
-
-	image.ID = id
-	return nil
+	return img, nil
 }
 
 func (r *carRepository) GetListingImages(ctx context.Context, listingID int64) ([]domain.CarImage, error) {
-	query := `
-		SELECT id, car_listing_id, image_url, display_order, is_primary, created_at
+	return queryAll(ctx, conn(ctx, r.db), `
+		SELECT `+imageColumns+`
 		FROM car_images
 		WHERE car_listing_id = ?
 		ORDER BY is_primary DESC, display_order ASC
-	`
-
-	rows, err := r.db.QueryContext(ctx, query, listingID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var images []domain.CarImage
-	for rows.Next() {
-		var img domain.CarImage
-		err := rows.Scan(&img.ID, &img.CarListingID, &img.ImageURL, &img.DisplayOrder, &img.IsPrimary, &img.CreatedAt)
-		if err != nil {
-			return nil, err
-		}
-		images = append(images, img)
-	}
-
-	return images, nil
+	`, scanImage, listingID)
 }
 
+// DeleteImage removes an image; if it was the primary image, the next image
+// in display order becomes primary.
 func (r *carRepository) DeleteImage(ctx context.Context, id int64) error {
-	query := `DELETE FROM car_images WHERE id = ?`
-	result, err := r.db.ExecContext(ctx, query, id)
-	if err != nil {
+	return withTx(ctx, r.db, func(ctx context.Context, q querier) error {
+		var listingID int64
+		var wasPrimary bool
+		err := q.QueryRowContext(ctx, `DELETE FROM car_images WHERE id = ? RETURNING car_listing_id, is_primary`, id).
+			Scan(&listingID, &wasPrimary)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return domain.ErrImageNotFound
+			}
+			return err
+		}
+
+		if wasPrimary {
+			_, err = q.ExecContext(ctx, `
+				UPDATE car_images SET is_primary = 1
+				WHERE id = (SELECT id FROM car_images WHERE car_listing_id = ? ORDER BY display_order, id LIMIT 1)`,
+				listingID)
+		}
 		return err
-	}
-
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-
-	if rowsAffected == 0 {
-		return domain.ErrNotFound
-	}
-
-	return nil
+	})
 }
 
+// SetPrimaryImage makes imageID the listing's only primary image. It fails
+// with domain.ErrImageNotFound if the image doesn't belong to the listing.
 func (r *carRepository) SetPrimaryImage(ctx context.Context, listingID int64, imageID int64) error {
-	tx, err := r.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
+	return withTx(ctx, r.db, func(ctx context.Context, q querier) error {
+		var exists int
+		err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM car_images WHERE id = ? AND car_listing_id = ?`, imageID, listingID).Scan(&exists)
+		if err != nil {
+			return err
+		}
+		if exists == 0 {
+			return domain.ErrImageNotFound
+		}
 
-	// Clear all primary flags for this listing
-	if _, err := tx.ExecContext(ctx, `UPDATE car_images SET is_primary = 0 WHERE car_listing_id = ?`, listingID); err != nil {
+		_, err = q.ExecContext(ctx, `UPDATE car_images SET is_primary = (id = ?) WHERE car_listing_id = ?`, imageID, listingID)
 		return err
-	}
-
-	// Set new primary image
-	if _, err := tx.ExecContext(ctx, `UPDATE car_images SET is_primary = 1 WHERE id = ? AND car_listing_id = ?`, imageID, listingID); err != nil {
-		return err
-	}
-
-	return tx.Commit()
+	})
 }
