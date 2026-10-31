@@ -5,7 +5,6 @@ import (
 	"car-marketplace/internal/usecase"
 	"car-marketplace/pkg/response"
 	"net/http"
-	"strconv"
 
 	"github.com/gin-gonic/gin"
 )
@@ -31,27 +30,24 @@ func NewCarHandler(carUseCase usecase.CarUseCase) *CarHandler {
 // @Success 201 {object} response.Response{data=domain.CarListing}
 // @Failure 400 {object} response.Response
 // @Failure 401 {object} response.Response
+// @Failure 409 {object} response.Response "VIN already listed"
 // @Failure 500 {object} response.Response
 // @Router /cars [post]
 func (h *CarHandler) Create(c *gin.Context) {
-	userID, _ := c.Get("user_id")
-
-	var req domain.CreateCarListingRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		response.Error(c, http.StatusBadRequest, "Invalid request body", err)
+	userID, ok := requireUserID(c)
+	if !ok {
 		return
 	}
 
-	listing, err := h.carUseCase.Create(c.Request.Context(), &req, userID.(int64))
+	var req domain.CreateCarListingRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		bindError(c, "Invalid request body", err)
+		return
+	}
+
+	listing, err := h.carUseCase.Create(c.Request.Context(), &req, userID)
 	if err != nil {
-		switch err {
-		case domain.ErrInvalidMake, domain.ErrInvalidModel, domain.ErrInvalidBodyType,
-			domain.ErrInvalidFuelType, domain.ErrInvalidTransmission, domain.ErrInvalidColor,
-			domain.ErrInvalidCondition:
-			response.Error(c, http.StatusBadRequest, err.Error(), err)
-		default:
-			response.Error(c, http.StatusInternalServerError, "Failed to create listing", err)
-		}
+		respondError(c, err)
 		return
 	}
 
@@ -60,7 +56,7 @@ func (h *CarHandler) Create(c *gin.Context) {
 
 // GetByID godoc
 // @Summary Get car listing by ID
-// @Description Get detailed information about a car listing
+// @Description Get detailed information about a car listing, including its make, model, images and features. Views by the owner are not counted.
 // @Tags cars
 // @Accept json
 // @Produce json
@@ -70,19 +66,14 @@ func (h *CarHandler) Create(c *gin.Context) {
 // @Failure 500 {object} response.Response
 // @Router /cars/{id} [get]
 func (h *CarHandler) GetByID(c *gin.Context) {
-	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
-	if err != nil {
-		response.Error(c, http.StatusBadRequest, "Invalid car listing ID", err)
+	id, ok := pathID(c, "id", "car listing ID")
+	if !ok {
 		return
 	}
 
-	listing, err := h.carUseCase.GetByID(c.Request.Context(), id, true)
+	listing, err := h.carUseCase.GetByID(c.Request.Context(), id, currentUserID(c))
 	if err != nil {
-		if err == domain.ErrCarListingNotFound {
-			response.Error(c, http.StatusNotFound, "Car listing not found", err)
-			return
-		}
-		response.Error(c, http.StatusInternalServerError, "Failed to get car listing", err)
+		respondError(c, err)
 		return
 	}
 
@@ -101,11 +92,11 @@ func (h *CarHandler) GetByID(c *gin.Context) {
 // @Param max_year query int false "Maximum year"
 // @Param min_price query number false "Minimum price"
 // @Param max_price query number false "Maximum price"
-// @Param city query string false "City"
-// @Param state query string false "State"
-// @Param country query string false "Country"
-// @Param search query string false "Search in title and description"
-// @Param sort_by query string false "Sort by (price_asc, price_desc, year_asc, year_desc, created_asc, created_desc)"
+// @Param city query string false "City (case-insensitive)"
+// @Param state query string false "State (case-insensitive)"
+// @Param country query string false "Country (case-insensitive)"
+// @Param search query string false "Full-text search in title and description (matches word prefixes)"
+// @Param sort_by query string false "Sort by (price_asc, price_desc, year_asc, year_desc, mileage_asc, mileage_desc, created_asc, created_desc)"
 // @Param page query int false "Page number" default(1)
 // @Param limit query int false "Items per page" default(20)
 // @Success 200 {object} response.PaginatedResponse{data=[]domain.CarListing}
@@ -115,31 +106,27 @@ func (h *CarHandler) GetByID(c *gin.Context) {
 func (h *CarHandler) List(c *gin.Context) {
 	var filter domain.CarListingFilter
 	if err := c.ShouldBindQuery(&filter); err != nil {
-		response.Error(c, http.StatusBadRequest, "Invalid query parameters", err)
+		bindError(c, "Invalid query parameters", err)
 		return
 	}
-
-	filter.SetDefaults()
 
 	listings, total, err := h.carUseCase.List(c.Request.Context(), &filter)
 	if err != nil {
-		response.Error(c, http.StatusInternalServerError, "Failed to list car listings", err)
+		respondError(c, err)
 		return
 	}
 
-	pagination := response.PaginationMeta{
+	response.Paginated(c, http.StatusOK, "Car listings retrieved successfully", listings, response.PaginationMeta{
 		Page:       filter.Page,
 		PerPage:    filter.Limit,
 		Total:      total,
-		TotalPages: int((total + int64(filter.Limit) - 1) / int64(filter.Limit)),
-	}
-
-	response.Paginated(c, http.StatusOK, "Car listings retrieved successfully", listings, pagination)
+		TotalPages: totalPages(total, filter.Limit),
+	})
 }
 
 // Update godoc
 // @Summary Update car listing
-// @Description Update an existing car listing (owner only)
+// @Description Update an existing car listing (owner only). Status may only be set to active or inactive; use the sold endpoint to mark a car as sold.
 // @Tags cars
 // @Accept json
 // @Produce json
@@ -151,35 +138,29 @@ func (h *CarHandler) List(c *gin.Context) {
 // @Failure 401 {object} response.Response
 // @Failure 403 {object} response.Response
 // @Failure 404 {object} response.Response
+// @Failure 409 {object} response.Response
 // @Failure 500 {object} response.Response
 // @Router /cars/{id} [put]
 func (h *CarHandler) Update(c *gin.Context) {
-	userID, _ := c.Get("user_id")
+	userID, ok := requireUserID(c)
+	if !ok {
+		return
+	}
 
-	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
-	if err != nil {
-		response.Error(c, http.StatusBadRequest, "Invalid car listing ID", err)
+	id, ok := pathID(c, "id", "car listing ID")
+	if !ok {
 		return
 	}
 
 	var req domain.UpdateCarListingRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.Error(c, http.StatusBadRequest, "Invalid request body", err)
+		bindError(c, "Invalid request body", err)
 		return
 	}
 
-	listing, err := h.carUseCase.Update(c.Request.Context(), id, &req, userID.(int64))
+	listing, err := h.carUseCase.Update(c.Request.Context(), id, &req, userID)
 	if err != nil {
-		switch err {
-		case domain.ErrCarListingNotFound:
-			response.Error(c, http.StatusNotFound, "Car listing not found", err)
-		case domain.ErrCarListingNotOwner:
-			response.Error(c, http.StatusForbidden, "You are not the owner of this listing", err)
-		case domain.ErrCarListingCannotEdit:
-			response.Error(c, http.StatusBadRequest, "This listing cannot be edited", err)
-		default:
-			response.Error(c, http.StatusInternalServerError, "Failed to update listing", err)
-		}
+		respondError(c, err)
 		return
 	}
 
@@ -202,23 +183,18 @@ func (h *CarHandler) Update(c *gin.Context) {
 // @Failure 500 {object} response.Response
 // @Router /cars/{id} [delete]
 func (h *CarHandler) Delete(c *gin.Context) {
-	userID, _ := c.Get("user_id")
-
-	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
-	if err != nil {
-		response.Error(c, http.StatusBadRequest, "Invalid car listing ID", err)
+	userID, ok := requireUserID(c)
+	if !ok {
 		return
 	}
 
-	if err := h.carUseCase.Delete(c.Request.Context(), id, userID.(int64)); err != nil {
-		switch err {
-		case domain.ErrCarListingNotFound:
-			response.Error(c, http.StatusNotFound, "Car listing not found", err)
-		case domain.ErrCarListingNotOwner:
-			response.Error(c, http.StatusForbidden, "You are not the owner of this listing", err)
-		default:
-			response.Error(c, http.StatusInternalServerError, "Failed to delete listing", err)
-		}
+	id, ok := pathID(c, "id", "car listing ID")
+	if !ok {
+		return
+	}
+
+	if err := h.carUseCase.Delete(c.Request.Context(), id, userID); err != nil {
+		respondError(c, err)
 		return
 	}
 
@@ -238,32 +214,144 @@ func (h *CarHandler) Delete(c *gin.Context) {
 // @Failure 401 {object} response.Response
 // @Failure 403 {object} response.Response
 // @Failure 404 {object} response.Response
+// @Failure 409 {object} response.Response "Already sold"
 // @Failure 500 {object} response.Response
 // @Router /cars/{id}/sold [post]
 func (h *CarHandler) MarkAsSold(c *gin.Context) {
-	userID, _ := c.Get("user_id")
-
-	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
-	if err != nil {
-		response.Error(c, http.StatusBadRequest, "Invalid car listing ID", err)
+	userID, ok := requireUserID(c)
+	if !ok {
 		return
 	}
 
-	if err := h.carUseCase.MarkAsSold(c.Request.Context(), id, userID.(int64)); err != nil {
-		switch err {
-		case domain.ErrCarListingNotFound:
-			response.Error(c, http.StatusNotFound, "Car listing not found", err)
-		case domain.ErrCarListingNotOwner:
-			response.Error(c, http.StatusForbidden, "You are not the owner of this listing", err)
-		case domain.ErrCarListingAlreadySold:
-			response.Error(c, http.StatusBadRequest, "This car has already been sold", err)
-		default:
-			response.Error(c, http.StatusInternalServerError, "Failed to mark as sold", err)
-		}
+	id, ok := pathID(c, "id", "car listing ID")
+	if !ok {
+		return
+	}
+
+	if err := h.carUseCase.MarkAsSold(c.Request.Context(), id, userID); err != nil {
+		respondError(c, err)
 		return
 	}
 
 	response.Success(c, http.StatusOK, "Car listing marked as sold", nil)
+}
+
+// AddImage godoc
+// @Summary Add an image to a listing
+// @Description Append an image URL to a listing (owner only). The first image becomes the primary image.
+// @Tags cars
+// @Accept json
+// @Produce json
+// @Security BearerAuth
+// @Param id path int true "Car Listing ID"
+// @Param request body domain.AddImageRequest true "Image"
+// @Success 201 {object} response.Response{data=domain.CarImage}
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 403 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Router /cars/{id}/images [post]
+func (h *CarHandler) AddImage(c *gin.Context) {
+	userID, ok := requireUserID(c)
+	if !ok {
+		return
+	}
+
+	id, ok := pathID(c, "id", "car listing ID")
+	if !ok {
+		return
+	}
+
+	var req domain.AddImageRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		bindError(c, "Invalid request body", err)
+		return
+	}
+
+	image, err := h.carUseCase.AddImage(c.Request.Context(), id, req.ImageURL, userID)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+
+	response.Success(c, http.StatusCreated, "Image added successfully", image)
+}
+
+// DeleteImage godoc
+// @Summary Delete a listing image
+// @Description Delete an image from a listing (owner only). If it was the primary image, the next image becomes primary.
+// @Tags cars
+// @Produce json
+// @Security BearerAuth
+// @Param id path int true "Car Listing ID"
+// @Param image_id path int true "Image ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 403 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Router /cars/{id}/images/{image_id} [delete]
+func (h *CarHandler) DeleteImage(c *gin.Context) {
+	userID, ok := requireUserID(c)
+	if !ok {
+		return
+	}
+
+	id, ok := pathID(c, "id", "car listing ID")
+	if !ok {
+		return
+	}
+	imageID, ok := pathID(c, "image_id", "image ID")
+	if !ok {
+		return
+	}
+
+	if err := h.carUseCase.DeleteImage(c.Request.Context(), id, imageID, userID); err != nil {
+		respondError(c, err)
+		return
+	}
+
+	response.Success(c, http.StatusOK, "Image deleted successfully", nil)
+}
+
+// SetPrimaryImage godoc
+// @Summary Set a listing's primary image
+// @Description Make an image the listing's primary image (owner only)
+// @Tags cars
+// @Produce json
+// @Security BearerAuth
+// @Param id path int true "Car Listing ID"
+// @Param image_id path int true "Image ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 403 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Router /cars/{id}/images/{image_id}/primary [put]
+func (h *CarHandler) SetPrimaryImage(c *gin.Context) {
+	userID, ok := requireUserID(c)
+	if !ok {
+		return
+	}
+
+	id, ok := pathID(c, "id", "car listing ID")
+	if !ok {
+		return
+	}
+	imageID, ok := pathID(c, "image_id", "image ID")
+	if !ok {
+		return
+	}
+
+	if err := h.carUseCase.SetPrimaryImage(c.Request.Context(), id, imageID, userID); err != nil {
+		respondError(c, err)
+		return
+	}
+
+	response.Success(c, http.StatusOK, "Primary image updated", nil)
 }
 
 // GetMakes godoc
@@ -278,7 +366,7 @@ func (h *CarHandler) MarkAsSold(c *gin.Context) {
 func (h *CarHandler) GetMakes(c *gin.Context) {
 	makes, err := h.carUseCase.GetAllMakes(c.Request.Context())
 	if err != nil {
-		response.Error(c, http.StatusInternalServerError, "Failed to get makes", err)
+		respondError(c, err)
 		return
 	}
 
@@ -297,15 +385,14 @@ func (h *CarHandler) GetMakes(c *gin.Context) {
 // @Failure 500 {object} response.Response
 // @Router /reference/makes/{make_id}/models [get]
 func (h *CarHandler) GetModels(c *gin.Context) {
-	makeID, err := strconv.ParseInt(c.Param("make_id"), 10, 64)
-	if err != nil {
-		response.Error(c, http.StatusBadRequest, "Invalid make ID", err)
+	makeID, ok := pathID(c, "make_id", "make ID")
+	if !ok {
 		return
 	}
 
 	models, err := h.carUseCase.GetModelsByMakeID(c.Request.Context(), makeID)
 	if err != nil {
-		response.Error(c, http.StatusInternalServerError, "Failed to get models", err)
+		respondError(c, err)
 		return
 	}
 
@@ -318,24 +405,14 @@ func (h *CarHandler) GetModels(c *gin.Context) {
 // @Tags reference-data
 // @Accept json
 // @Produce json
-// @Success 200 {object} response.Response
+// @Success 200 {object} response.Response{data=domain.ReferenceData}
 // @Failure 500 {object} response.Response
 // @Router /reference/data [get]
 func (h *CarHandler) GetReferenceData(c *gin.Context) {
-	bodyTypes, _ := h.carUseCase.GetAllBodyTypes(c.Request.Context())
-	fuelTypes, _ := h.carUseCase.GetAllFuelTypes(c.Request.Context())
-	transmissions, _ := h.carUseCase.GetAllTransmissions(c.Request.Context())
-	colors, _ := h.carUseCase.GetAllColors(c.Request.Context())
-	conditions, _ := h.carUseCase.GetAllConditions(c.Request.Context())
-	features, _ := h.carUseCase.GetAllFeatures(c.Request.Context())
-
-	data := gin.H{
-		"body_types":    bodyTypes,
-		"fuel_types":    fuelTypes,
-		"transmissions": transmissions,
-		"colors":        colors,
-		"conditions":    conditions,
-		"features":      features,
+	data, err := h.carUseCase.GetReferenceData(c.Request.Context())
+	if err != nil {
+		respondError(c, err)
+		return
 	}
 
 	response.Success(c, http.StatusOK, "Reference data retrieved successfully", data)

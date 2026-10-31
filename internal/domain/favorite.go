@@ -16,8 +16,8 @@ type Favorite struct {
 // FavoriteFilter represents filters for listing favorites
 type FavoriteFilter struct {
 	UserID int64 `form:"user_id"`
-	Page   int   `form:"page" binding:"min=1"`
-	Limit  int   `form:"limit" binding:"min=1,max=100"`
+	Page   int   `form:"page" binding:"omitempty,min=1"`
+	Limit  int   `form:"limit" binding:"omitempty,min=1,max=100"`
 }
 
 // SetDefaults sets default values for pagination

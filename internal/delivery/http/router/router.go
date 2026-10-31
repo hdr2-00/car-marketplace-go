@@ -3,13 +3,15 @@ package router
 import (
 	"car-marketplace/internal/delivery/http/handler"
 	"car-marketplace/internal/delivery/http/middleware"
+	"context"
+	"fmt"
+	"log"
 	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	swaggerFiles "github.com/swaggo/files"
 	ginSwagger "github.com/swaggo/gin-swagger"
-	"golang.org/x/time/rate"
 )
 
 // RouterConfig holds dependencies for router setup
@@ -20,30 +22,44 @@ type RouterConfig struct {
 	ReviewHandler   *handler.ReviewHandler
 	FavoriteHandler *handler.FavoriteHandler
 	AuthMiddleware  *middleware.AuthMiddleware
-	RateLimiter     *middleware.RateLimiter
+	// RateLimiter applies to all API routes; nil disables it.
+	RateLimiter *middleware.RateLimiter
+	// AuthRateLimiter adds a stricter limit to the public auth endpoints; nil disables it.
+	AuthRateLimiter *middleware.RateLimiter
+	// AllowedOrigins lists the frontend origins allowed by CORS.
+	AllowedOrigins []string
+	// TrustedProxies lists proxies whose X-Forwarded-For header is believed
+	// when determining the client IP. Empty trusts none.
+	TrustedProxies []string
+	// HealthCheck reports whether dependencies (e.g. the database) are reachable.
+	HealthCheck func(ctx context.Context) error
 }
 
 // SetupRouter configures and returns the Gin router
-func SetupRouter(config RouterConfig) *gin.Engine {
+func SetupRouter(config RouterConfig) (*gin.Engine, error) {
 	router := gin.New()
+
+	// Without trusted proxies, ClientIP is the TCP peer address, so clients
+	// can't dodge per-IP rate limits by sending a fake X-Forwarded-For.
+	if err := router.SetTrustedProxies(config.TrustedProxies); err != nil {
+		return nil, fmt.Errorf("invalid trusted proxies: %w", err)
+	}
 
 	// Global middleware
 	router.Use(gin.Logger())
 	router.Use(gin.Recovery())
 
-	// Custom CORS configuration
-	corsConfig := middleware.CORSConfig{
-		AllowOrigins:     []string{"http://localhost:3000", "http://localhost:5173"}, // Your frontend URLs
+	router.Use(middleware.CORSWithConfig(middleware.CORSConfig{
+		AllowOrigins:     config.AllowedOrigins,
 		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
 		AllowHeaders:     []string{"Content-Type", "Authorization", "X-Requested-With"},
 		ExposeHeaders:    []string{"Content-Length", "Content-Type"},
 		AllowCredentials: true,
 		MaxAge:           12 * 3600,
-	}
-	router.Use(middleware.CORSWithConfig(corsConfig))
+	}))
 
 	// Health check endpoint (no versioning, no rate limit)
-	router.GET("/health", healthCheck)
+	router.GET("/health", healthCheck(config.HealthCheck))
 	router.GET("/ping", ping)
 
 	// Swagger documentation
@@ -76,7 +92,7 @@ func SetupRouter(config RouterConfig) *gin.Engine {
 		})
 	})
 
-	return router
+	return router, nil
 }
 
 // setupPublicRoutes configures public routes (no authentication)
@@ -84,12 +100,9 @@ func setupPublicRoutes(rg *gin.RouterGroup, config RouterConfig) {
 	auth := rg.Group("/auth")
 	{
 		// Stricter rate limiting for auth endpoints
-		authLimiter := middleware.NewRateLimiter(
-			rate.Limit(5), // 5 requests per second
-			10,            // burst of 10
-			5*time.Minute, // 5 minutes cleanup
-		)
-		auth.Use(authLimiter.Limit())
+		if config.AuthRateLimiter != nil {
+			auth.Use(config.AuthRateLimiter.Limit())
+		}
 
 		auth.POST("/register", config.AuthHandler.Register)
 		auth.POST("/login", config.AuthHandler.Login)
@@ -142,6 +155,9 @@ func setupProtectedRoutes(rg *gin.RouterGroup, config RouterConfig) {
 		cars.PUT("/:id", config.CarHandler.Update)
 		cars.DELETE("/:id", config.CarHandler.Delete)
 		cars.POST("/:id/sold", config.CarHandler.MarkAsSold)
+		cars.POST("/:id/images", config.CarHandler.AddImage)
+		cars.DELETE("/:id/images/:image_id", config.CarHandler.DeleteImage)
+		cars.PUT("/:id/images/:image_id/primary", config.CarHandler.SetPrimaryImage)
 	}
 
 	// Favorites
@@ -171,18 +187,35 @@ func setupProtectedRoutes(rg *gin.RouterGroup, config RouterConfig) {
 
 // healthCheck returns the health status of the API
 // @Summary Health check
-// @Description Check if the API is running
+// @Description Check that the API and its database are available
 // @Tags system
 // @Accept json
 // @Produce json
 // @Success 200 {object} map[string]interface{}
+// @Failure 503 {object} map[string]interface{}
 // @Router /health [get]
-func healthCheck(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{
-		"status":  "healthy",
-		"message": "Car Marketplace API is running",
-		"version": "1.0.0",
-	})
+func healthCheck(check func(ctx context.Context) error) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if check != nil {
+			ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+			defer cancel()
+
+			if err := check(ctx); err != nil {
+				log.Printf("health check failed: %v", err)
+				c.JSON(http.StatusServiceUnavailable, gin.H{
+					"status":  "unhealthy",
+					"message": "Database unavailable",
+				})
+				return
+			}
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"status":  "healthy",
+			"message": "Car Marketplace API is running",
+			"version": "1.0.0",
+		})
+	}
 }
 
 // ping returns a simple pong response

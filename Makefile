@@ -1,4 +1,4 @@
-.PHONY: help run build test clean migrate swagger deps dev docker-build docker-run docker-compose-up docker-compose-down
+.PHONY: help run build test test-race clean migrate swagger deps dev docker-build docker-run docker-compose-up docker-compose-down
 
 # Variables
 APP_NAME=car-marketplace
@@ -20,7 +20,7 @@ deps: ## Install dependencies
 
 run: ## Run the application
 	@echo "🚀 Starting application..."
-	go run $(MAIN_PATH)/main.go
+	go run $(MAIN_PATH)
 
 dev: ## Run the application with hot reload (requires air)
 	@echo "🔥 Starting application with hot reload..."
@@ -28,17 +28,21 @@ dev: ## Run the application with hot reload (requires air)
 		echo "Installing air..."; \
 		go install github.com/air-verse/air@latest; \
 	fi
-	go dev $(MAIN_PATH)/main.go
+	air
 
 build: ## Build the application
 	@echo "🔨 Building application..."
 	@mkdir -p $(BUILD_DIR)
-	go build -o $(BUILD_DIR)/$(APP_NAME) $(MAIN_PATH)/main.go
+	go build -o $(BUILD_DIR)/$(APP_NAME) $(MAIN_PATH)
 	@echo "✅ Build complete: $(BUILD_DIR)/$(APP_NAME)"
 
 test: ## Run tests
 	@echo "🧪 Running tests..."
 	go test -v -cover ./...
+
+test-race: ## Run tests with the race detector
+	@echo "🧪 Running tests with race detection..."
+	go test -race ./...
 
 test-coverage: ## Run tests with coverage report
 	@echo "🧪 Running tests with coverage..."
@@ -46,32 +50,30 @@ test-coverage: ## Run tests with coverage report
 	go tool cover -html=coverage.out -o coverage.html
 	@echo "✅ Coverage report generated: coverage.html"
 
-migrate: ## Run database migrations
+migrate: ## Run database migrations (the server also applies them on startup)
 	@echo "🗄️  Running database migrations..."
 	@mkdir -p ./data
-	sqlite3 $(DB_PATH) < $(MIGRATIONS_PATH)/001_initial_schema.sql
+	go run $(MAIN_PATH) -migrate-only
 	@echo "✅ Migrations complete"
 
 migrate-with-data: ## Run migrations and load sample data
 	@echo "🗄️  Running database migrations with sample data..."
 	@mkdir -p ./data
-	sqlite3 $(DB_PATH) < $(MIGRATIONS_PATH)/001_initial_schema.sql
-	sqlite3 $(DB_PATH) < $(MIGRATIONS_PATH)/002_sample_data.sql
+	go run $(MAIN_PATH) -migrate-only -seed
 	@echo "✅ Migrations and sample data loaded"
 
-migrate-fresh: ## Drop all tables and re-run migrations
+migrate-fresh: ## Delete the database and re-run migrations
 	@echo "🗄️  Fresh migration..."
-	@rm -f $(DB_PATH)
+	@rm -f $(DB_PATH) $(DB_PATH)-shm $(DB_PATH)-wal
 	@mkdir -p ./data
-	sqlite3 $(DB_PATH) < $(MIGRATIONS_PATH)/001_initial_schema.sql
+	go run $(MAIN_PATH) -migrate-only
 	@echo "✅ Fresh migrations complete"
 
 migrate-fresh-with-data: ## Fresh migration with sample data
 	@echo "🗄️  Fresh migration with sample data..."
-	@rm -f $(DB_PATH)
+	@rm -f $(DB_PATH) $(DB_PATH)-shm $(DB_PATH)-wal
 	@mkdir -p ./data
-	sqlite3 $(DB_PATH) < $(MIGRATIONS_PATH)/001_initial_schema.sql
-	sqlite3 $(DB_PATH) < $(MIGRATIONS_PATH)/002_sample_data.sql
+	go run $(MAIN_PATH) -migrate-only -seed
 	@echo "✅ Fresh migrations with sample data complete"
 
 swagger: ## Generate Swagger documentation
@@ -87,7 +89,7 @@ clean: ## Clean build artifacts
 
 clean-db: ## Remove database file
 	@echo "🗑️  Removing database..."
-	@rm -f $(DB_PATH)
+	@rm -f $(DB_PATH) $(DB_PATH)-shm $(DB_PATH)-wal
 	@echo "✅ Database removed"
 
 lint: ## Run linter

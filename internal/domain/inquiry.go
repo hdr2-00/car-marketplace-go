@@ -28,12 +28,15 @@ type CreateInquiryRequest struct {
 
 // InquiryFilter represents filters for listing inquiries
 type InquiryFilter struct {
-	CarListingID *int64 `form:"car_listing_id"`
-	BuyerID      *int64 `form:"buyer_id"`
-	SellerID     *int64 `form:"seller_id"`
-	IsRead       *bool  `form:"is_read"`
-	Page         int    `form:"page" binding:"min=1"`
-	Limit        int    `form:"limit" binding:"min=1,max=100"`
+	// ParticipantID limits results to inquiries where the user is the buyer
+	// or the seller. Set by the server, never bound from the request.
+	ParticipantID *int64 `form:"-"`
+	CarListingID  *int64 `form:"car_listing_id"`
+	BuyerID       *int64 `form:"buyer_id"`
+	SellerID      *int64 `form:"seller_id"`
+	IsRead        *bool  `form:"is_read"`
+	Page          int    `form:"page" binding:"omitempty,min=1"`
+	Limit         int    `form:"limit" binding:"omitempty,min=1,max=100"`
 }
 
 // SetDefaults sets default values for pagination

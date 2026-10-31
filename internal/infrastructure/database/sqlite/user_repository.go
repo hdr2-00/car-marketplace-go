@@ -2,9 +2,11 @@ package sqlite
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
-	"strings"
+	"time"
 
 	"car-marketplace/internal/domain"
 	"car-marketplace/internal/repository"
@@ -27,7 +29,7 @@ func (r *userRepository) Create(ctx context.Context, user *domain.User) error {
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 	`
 
-	result, err := r.db.ExecContext(ctx, query,
+	result, err := conn(ctx, r.db).ExecContext(ctx, query,
 		user.Email,
 		user.PasswordHash,
 		user.UserTypeID,
@@ -38,7 +40,7 @@ func (r *userRepository) Create(ctx context.Context, user *domain.User) error {
 	)
 
 	if err != nil {
-		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+		if isUniqueViolation(err, "users.email") {
 			return domain.ErrUserAlreadyExists
 		}
 		return err
@@ -68,7 +70,7 @@ func (r *userRepository) GetByID(ctx context.Context, id int64) (*domain.User, e
 		UserType: &domain.UserTypeEntity{},
 	}
 
-	err := r.db.QueryRowContext(ctx, query, id).Scan(
+	err := conn(ctx, r.db).QueryRowContext(ctx, query, id).Scan(
 		&user.ID,
 		&user.Email,
 		&user.PasswordHash,
@@ -109,7 +111,7 @@ func (r *userRepository) GetByEmail(ctx context.Context, email string) (*domain.
 		UserType: &domain.UserTypeEntity{},
 	}
 
-	err := r.db.QueryRowContext(ctx, query, email).Scan(
+	err := conn(ctx, r.db).QueryRowContext(ctx, query, email).Scan(
 		&user.ID,
 		&user.Email,
 		&user.PasswordHash,
@@ -144,7 +146,7 @@ func (r *userRepository) Update(ctx context.Context, user *domain.User) error {
 		WHERE id = ?
 	`
 
-	result, err := r.db.ExecContext(ctx, query,
+	result, err := conn(ctx, r.db).ExecContext(ctx, query,
 		user.Email,
 		user.PasswordHash,
 		user.UserTypeID,
@@ -174,7 +176,7 @@ func (r *userRepository) Update(ctx context.Context, user *domain.User) error {
 func (r *userRepository) Delete(ctx context.Context, id int64) error {
 	query := `DELETE FROM users WHERE id = ?`
 
-	result, err := r.db.ExecContext(ctx, query, id)
+	result, err := conn(ctx, r.db).ExecContext(ctx, query, id)
 	if err != nil {
 		return err
 	}
@@ -196,7 +198,7 @@ func (r *userRepository) GetUserTypeByName(ctx context.Context, name string) (*d
 	query := `SELECT id, name, COALESCE(description, ''), created_at, updated_at FROM user_types WHERE name = ?`
 
 	userType := &domain.UserTypeEntity{}
-	err := r.db.QueryRowContext(ctx, query, name).Scan(
+	err := conn(ctx, r.db).QueryRowContext(ctx, query, name).Scan(
 		&userType.ID,
 		&userType.Name,
 		&userType.Description,
@@ -219,7 +221,7 @@ func (r *userRepository) GetUserTypeByID(ctx context.Context, id int64) (*domain
 	query := `SELECT id, name, COALESCE(description, ''), created_at, updated_at FROM user_types WHERE id = ?`
 
 	userType := &domain.UserTypeEntity{}
-	err := r.db.QueryRowContext(ctx, query, id).Scan(
+	err := conn(ctx, r.db).QueryRowContext(ctx, query, id).Scan(
 		&userType.ID,
 		&userType.Name,
 		&userType.Description,
@@ -244,7 +246,7 @@ func (r *userRepository) CreateUserProfile(ctx context.Context, profile *domain.
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 	`
 
-	result, err := r.db.ExecContext(ctx, query,
+	result, err := conn(ctx, r.db).ExecContext(ctx, query,
 		profile.UserID,
 		profile.FirstName,
 		profile.LastName,
@@ -277,7 +279,7 @@ func (r *userRepository) GetUserProfile(ctx context.Context, userID int64) (*dom
 	`
 
 	profile := &domain.UserProfile{}
-	err := r.db.QueryRowContext(ctx, query, userID).Scan(
+	err := conn(ctx, r.db).QueryRowContext(ctx, query, userID).Scan(
 		&profile.ID,
 		&profile.UserID,
 		&profile.FirstName,
@@ -306,7 +308,7 @@ func (r *userRepository) UpdateUserProfile(ctx context.Context, profile *domain.
 		WHERE user_id = ?
 	`
 
-	result, err := r.db.ExecContext(ctx, query,
+	result, err := conn(ctx, r.db).ExecContext(ctx, query,
 		profile.FirstName,
 		profile.LastName,
 		profile.PhoneNumber,
@@ -340,7 +342,7 @@ func (r *userRepository) CreateBusinessProfile(ctx context.Context, profile *dom
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 
-	result, err := r.db.ExecContext(ctx, query,
+	result, err := conn(ctx, r.db).ExecContext(ctx, query,
 		profile.UserID,
 		profile.BusinessName,
 		profile.BusinessLicense,
@@ -378,7 +380,7 @@ func (r *userRepository) GetBusinessProfile(ctx context.Context, userID int64) (
 	`
 
 	profile := &domain.BusinessProfile{}
-	err := r.db.QueryRowContext(ctx, query, userID).Scan(
+	err := conn(ctx, r.db).QueryRowContext(ctx, query, userID).Scan(
 		&profile.ID,
 		&profile.UserID,
 		&profile.BusinessName,
@@ -412,7 +414,7 @@ func (r *userRepository) UpdateBusinessProfile(ctx context.Context, profile *dom
 		WHERE user_id = ?
 	`
 
-	result, err := r.db.ExecContext(ctx, query,
+	result, err := conn(ctx, r.db).ExecContext(ctx, query,
 		profile.BusinessName,
 		profile.BusinessLicense,
 		profile.TaxID,
@@ -441,19 +443,26 @@ func (r *userRepository) UpdateBusinessProfile(ctx context.Context, profile *dom
 	return nil
 }
 
-// CreateRefreshToken stores a refresh token
+// hashToken returns the SHA-256 digest stored in place of a raw refresh
+// token, so a database leak does not expose usable tokens.
+func hashToken(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
+
+// CreateRefreshToken stores the hash of a refresh token
 func (r *userRepository) CreateRefreshToken(ctx context.Context, token *domain.RefreshToken) error {
 	query := `
 		INSERT INTO refresh_tokens (user_id, token, expires_at, is_revoked, created_at)
 		VALUES (?, ?, ?, ?, ?)
 	`
 
-	result, err := r.db.ExecContext(ctx, query,
+	result, err := conn(ctx, r.db).ExecContext(ctx, query,
 		token.UserID,
-		token.Token,
-		token.ExpiresAt,
+		hashToken(token.Token),
+		token.ExpiresAt.UTC(),
 		token.IsRevoked,
-		token.CreatedAt,
+		token.CreatedAt.UTC(),
 	)
 
 	if err != nil {
@@ -469,21 +478,21 @@ func (r *userRepository) CreateRefreshToken(ctx context.Context, token *domain.R
 	return nil
 }
 
-// GetRefreshToken retrieves a refresh token
-func (r *userRepository) GetRefreshToken(ctx context.Context, token string) (*domain.RefreshToken, error) {
+// ConsumeRefreshToken atomically revokes a valid (unrevoked, unexpired)
+// refresh token and returns it. Concurrent calls with the same token cannot
+// both succeed, so a token can be exchanged at most once.
+func (r *userRepository) ConsumeRefreshToken(ctx context.Context, token string) (*domain.RefreshToken, error) {
 	query := `
-		SELECT id, user_id, token, expires_at, is_revoked, created_at
-		FROM refresh_tokens
-		WHERE token = ?
+		UPDATE refresh_tokens SET is_revoked = 1
+		WHERE token = ? AND is_revoked = 0 AND expires_at > ?
+		RETURNING id, user_id, expires_at, created_at
 	`
 
-	refreshToken := &domain.RefreshToken{}
-	err := r.db.QueryRowContext(ctx, query, token).Scan(
+	refreshToken := &domain.RefreshToken{Token: token, IsRevoked: true}
+	err := conn(ctx, r.db).QueryRowContext(ctx, query, hashToken(token), time.Now().UTC()).Scan(
 		&refreshToken.ID,
 		&refreshToken.UserID,
-		&refreshToken.Token,
 		&refreshToken.ExpiresAt,
-		&refreshToken.IsRevoked,
 		&refreshToken.CreatedAt,
 	)
 
@@ -501,7 +510,7 @@ func (r *userRepository) GetRefreshToken(ctx context.Context, token string) (*do
 func (r *userRepository) RevokeRefreshToken(ctx context.Context, token string) error {
 	query := `UPDATE refresh_tokens SET is_revoked = 1 WHERE token = ?`
 
-	_, err := r.db.ExecContext(ctx, query, token)
+	_, err := conn(ctx, r.db).ExecContext(ctx, query, hashToken(token))
 	return err
 }
 
@@ -509,14 +518,14 @@ func (r *userRepository) RevokeRefreshToken(ctx context.Context, token string) e
 func (r *userRepository) RevokeAllUserTokens(ctx context.Context, userID int64) error {
 	query := `UPDATE refresh_tokens SET is_revoked = 1 WHERE user_id = ?`
 
-	_, err := r.db.ExecContext(ctx, query, userID)
+	_, err := conn(ctx, r.db).ExecContext(ctx, query, userID)
 	return err
 }
 
-// DeleteExpiredTokens removes expired tokens from the database
+// DeleteExpiredTokens removes expired and revoked tokens, which can never be used again
 func (r *userRepository) DeleteExpiredTokens(ctx context.Context) error {
-	query := `DELETE FROM refresh_tokens WHERE expires_at < datetime('now')`
+	query := `DELETE FROM refresh_tokens WHERE expires_at <= ? OR is_revoked = 1`
 
-	_, err := r.db.ExecContext(ctx, query)
+	_, err := conn(ctx, r.db).ExecContext(ctx, query, time.Now().UTC())
 	return err
 }

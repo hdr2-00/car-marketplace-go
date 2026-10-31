@@ -7,9 +7,14 @@ import (
 	"time"
 )
 
+// referenceCacheTTL bounds how stale cached reference data can get.
+const referenceCacheTTL = 10 * time.Minute
+
 type CarUseCase interface {
 	Create(ctx context.Context, req *domain.CreateCarListingRequest, sellerID int64) (*domain.CarListing, error)
-	GetByID(ctx context.Context, id int64, incrementViews bool) (*domain.CarListing, error)
+	// GetByID returns a listing with its related data and records a view,
+	// unless viewerID is the listing's owner (viewerID 0 means anonymous).
+	GetByID(ctx context.Context, id int64, viewerID int64) (*domain.CarListing, error)
 	Update(ctx context.Context, id int64, req *domain.UpdateCarListingRequest, userID int64) (*domain.CarListing, error)
 	Delete(ctx context.Context, id int64, userID int64) error
 	List(ctx context.Context, filter *domain.CarListingFilter) ([]domain.CarListing, int64, error)
@@ -18,60 +23,31 @@ type CarUseCase interface {
 	// Reference data
 	GetAllMakes(ctx context.Context) ([]domain.CarMake, error)
 	GetModelsByMakeID(ctx context.Context, makeID int64) ([]domain.CarModel, error)
-	GetAllBodyTypes(ctx context.Context) ([]domain.BodyType, error)
-	GetAllFuelTypes(ctx context.Context) ([]domain.FuelType, error)
-	GetAllTransmissions(ctx context.Context) ([]domain.TransmissionType, error)
-	GetAllColors(ctx context.Context) ([]domain.Color, error)
-	GetAllConditions(ctx context.Context) ([]domain.CarCondition, error)
-	GetAllFeatures(ctx context.Context) ([]domain.Feature, error)
+	GetReferenceData(ctx context.Context) (*domain.ReferenceData, error)
 
 	// Image operations
 	AddImage(ctx context.Context, listingID int64, imageURL string, userID int64) (*domain.CarImage, error)
-	DeleteImage(ctx context.Context, imageID int64, userID int64) error
+	DeleteImage(ctx context.Context, listingID int64, imageID int64, userID int64) error
 	SetPrimaryImage(ctx context.Context, listingID int64, imageID int64, userID int64) error
 }
 
 type carUseCase struct {
+	tx      repository.Transactor
 	carRepo repository.CarRepository
+	refs    *referenceCache
+	views   *ViewCounter
 }
 
-func NewCarUseCase(carRepo repository.CarRepository) CarUseCase {
+func NewCarUseCase(tx repository.Transactor, carRepo repository.CarRepository, views *ViewCounter) CarUseCase {
 	return &carUseCase{
+		tx:      tx,
 		carRepo: carRepo,
+		refs:    newReferenceCache(carRepo, referenceCacheTTL),
+		views:   views,
 	}
 }
 
 func (uc *carUseCase) Create(ctx context.Context, req *domain.CreateCarListingRequest, sellerID int64) (*domain.CarListing, error) {
-	// Validate reference data exists
-	if _, err := uc.carRepo.GetMakeByID(ctx, req.MakeID); err != nil {
-		return nil, domain.ErrInvalidMake
-	}
-
-	if _, err := uc.carRepo.GetModelByID(ctx, req.ModelID); err != nil {
-		return nil, domain.ErrInvalidModel
-	}
-
-	if _, err := uc.carRepo.GetBodyTypeByID(ctx, req.BodyTypeID); err != nil {
-		return nil, domain.ErrInvalidBodyType
-	}
-
-	if _, err := uc.carRepo.GetFuelTypeByID(ctx, req.FuelTypeID); err != nil {
-		return nil, domain.ErrInvalidFuelType
-	}
-
-	if _, err := uc.carRepo.GetTransmissionByID(ctx, req.TransmissionID); err != nil {
-		return nil, domain.ErrInvalidTransmission
-	}
-
-	if _, err := uc.carRepo.GetColorByID(ctx, req.ColorID); err != nil {
-		return nil, domain.ErrInvalidColor
-	}
-
-	if _, err := uc.carRepo.GetConditionByID(ctx, req.ConditionID); err != nil {
-		return nil, domain.ErrInvalidCondition
-	}
-
-	// Create listing
 	now := time.Now()
 	listing := &domain.CarListing{
 		SellerID:        sellerID,
@@ -98,213 +74,167 @@ func (uc *carUseCase) Create(ctx context.Context, req *domain.CreateCarListingRe
 		State:           req.State,
 		Country:         req.Country,
 		PostalCode:      req.PostalCode,
-		Status:          "active",
-		IsFeatured:      false,
-		ViewsCount:      0,
+		Status:          domain.ListingStatusActive,
 		CreatedAt:       now,
 		UpdatedAt:       now,
 	}
 
-	if err := uc.carRepo.Create(ctx, listing); err != nil {
+	refs, err := uc.refs.get(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := refs.validate(listing, req.FeatureIDs); err != nil {
 		return nil, err
 	}
 
-	// Add features
-	if len(req.FeatureIDs) > 0 {
-		if err := uc.carRepo.AddFeaturesToListing(ctx, listing.ID, req.FeatureIDs); err != nil {
-			return nil, err
+	err = uc.tx.WithinTx(ctx, func(ctx context.Context) error {
+		if err := uc.carRepo.Create(ctx, listing); err != nil {
+			return err
 		}
+		if len(req.FeatureIDs) > 0 {
+			return uc.carRepo.ReplaceListingFeatures(ctx, listing.ID, req.FeatureIDs)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 
-	// Load full listing with related data
-	return uc.carRepo.GetByID(ctx, listing.ID)
+	return uc.load(ctx, listing.ID)
 }
 
-func (uc *carUseCase) GetByID(ctx context.Context, id int64, incrementViews bool) (*domain.CarListing, error) {
+func (uc *carUseCase) GetByID(ctx context.Context, id int64, viewerID int64) (*domain.CarListing, error) {
+	listing, err := uc.load(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+
+	if !listing.IsOwner(viewerID) {
+		uc.views.Record(id)
+		listing.ViewsCount++
+	}
+
+	return listing, nil
+}
+
+// load returns a listing with its reference entities, images and features.
+// Its view count includes views not yet flushed to the database.
+func (uc *carUseCase) load(ctx context.Context, id int64) (*domain.CarListing, error) {
 	listing, err := uc.carRepo.GetByID(ctx, id)
 	if err != nil {
 		return nil, err
 	}
 
-	// Increment views if requested
-	if incrementViews {
-		_ = uc.carRepo.IncrementViews(ctx, id)
+	refs, err := uc.refs.get(ctx)
+	if err != nil {
+		return nil, err
+	}
+	refs.attach(listing)
+
+	if listing.Images, err = uc.carRepo.GetListingImages(ctx, id); err != nil {
+		return nil, err
+	}
+	if listing.Features, err = uc.carRepo.GetListingFeatures(ctx, id); err != nil {
+		return nil, err
+	}
+	listing.ViewsCount += uc.views.Pending(id)
+
+	return listing, nil
+}
+
+// owned returns a listing if userID owns it.
+func (uc *carUseCase) owned(ctx context.Context, id int64, userID int64) (*domain.CarListing, error) {
+	listing, err := uc.carRepo.GetByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+
+	if !listing.IsOwner(userID) {
+		return nil, domain.ErrCarListingNotOwner
 	}
 
 	return listing, nil
 }
 
 func (uc *carUseCase) Update(ctx context.Context, id int64, req *domain.UpdateCarListingRequest, userID int64) (*domain.CarListing, error) {
-	// Get existing listing
-	listing, err := uc.carRepo.GetByID(ctx, id)
+	listing, err := uc.owned(ctx, id, userID)
 	if err != nil {
 		return nil, err
 	}
 
-	// Check ownership
-	if !listing.IsOwner(userID) {
-		return nil, domain.ErrCarListingNotOwner
-	}
-
-	// Check if can edit
 	if !listing.CanEdit() {
 		return nil, domain.ErrCarListingCannotEdit
 	}
 
-	// Update fields
-	if req.MakeID != nil {
-		if _, err := uc.carRepo.GetMakeByID(ctx, *req.MakeID); err != nil {
-			return nil, domain.ErrInvalidMake
-		}
-		listing.MakeID = *req.MakeID
-	}
-
-	if req.ModelID != nil {
-		if _, err := uc.carRepo.GetModelByID(ctx, *req.ModelID); err != nil {
-			return nil, domain.ErrInvalidModel
-		}
-		listing.ModelID = *req.ModelID
-	}
-
-	if req.Year != nil {
-		listing.Year = *req.Year
-	}
-
-	if req.BodyTypeID != nil {
-		if _, err := uc.carRepo.GetBodyTypeByID(ctx, *req.BodyTypeID); err != nil {
-			return nil, domain.ErrInvalidBodyType
-		}
-		listing.BodyTypeID = *req.BodyTypeID
-	}
-
-	if req.FuelTypeID != nil {
-		if _, err := uc.carRepo.GetFuelTypeByID(ctx, *req.FuelTypeID); err != nil {
-			return nil, domain.ErrInvalidFuelType
-		}
-		listing.FuelTypeID = *req.FuelTypeID
-	}
-
-	if req.TransmissionID != nil {
-		if _, err := uc.carRepo.GetTransmissionByID(ctx, *req.TransmissionID); err != nil {
-			return nil, domain.ErrInvalidTransmission
-		}
-		listing.TransmissionID = *req.TransmissionID
-	}
-
-	if req.ColorID != nil {
-		if _, err := uc.carRepo.GetColorByID(ctx, *req.ColorID); err != nil {
-			return nil, domain.ErrInvalidColor
-		}
-		listing.ColorID = *req.ColorID
-	}
-
-	if req.ConditionID != nil {
-		if _, err := uc.carRepo.GetConditionByID(ctx, *req.ConditionID); err != nil {
-			return nil, domain.ErrInvalidCondition
-		}
-		listing.ConditionID = *req.ConditionID
-	}
-
-	if req.VIN != nil {
-		listing.VIN = *req.VIN
-	}
-
-	if req.Mileage != nil {
-		listing.Mileage = *req.Mileage
-	}
-
-	if req.EngineSize != nil {
-		listing.EngineSize = *req.EngineSize
-	}
-
-	if req.Horsepower != nil {
-		listing.Horsepower = *req.Horsepower
-	}
-
-	if req.NumberOfDoors != nil {
-		listing.NumberOfDoors = *req.NumberOfDoors
-	}
-
-	if req.SeatingCapacity != nil {
-		listing.SeatingCapacity = *req.SeatingCapacity
-	}
-
-	if req.Price != nil {
-		listing.Price = *req.Price
-	}
-
-	if req.Currency != nil {
-		listing.Currency = *req.Currency
-	}
-
-	if req.IsNegotiable != nil {
-		listing.IsNegotiable = *req.IsNegotiable
-	}
-
-	if req.Title != nil {
-		listing.Title = *req.Title
-	}
-
-	if req.Description != nil {
-		listing.Description = *req.Description
-	}
-
-	if req.City != nil {
-		listing.City = *req.City
-	}
-
-	if req.State != nil {
-		listing.State = *req.State
-	}
-
-	if req.Country != nil {
-		listing.Country = *req.Country
-	}
-
-	if req.PostalCode != nil {
-		listing.PostalCode = *req.PostalCode
-	}
+	setIfPresent(&listing.MakeID, req.MakeID)
+	setIfPresent(&listing.ModelID, req.ModelID)
+	setIfPresent(&listing.Year, req.Year)
+	setIfPresent(&listing.BodyTypeID, req.BodyTypeID)
+	setIfPresent(&listing.FuelTypeID, req.FuelTypeID)
+	setIfPresent(&listing.TransmissionID, req.TransmissionID)
+	setIfPresent(&listing.ColorID, req.ColorID)
+	setIfPresent(&listing.ConditionID, req.ConditionID)
+	setIfPresent(&listing.VIN, req.VIN)
+	setIfPresent(&listing.Mileage, req.Mileage)
+	setIfPresent(&listing.EngineSize, req.EngineSize)
+	setIfPresent(&listing.Horsepower, req.Horsepower)
+	setIfPresent(&listing.NumberOfDoors, req.NumberOfDoors)
+	setIfPresent(&listing.SeatingCapacity, req.SeatingCapacity)
+	setIfPresent(&listing.Price, req.Price)
+	setIfPresent(&listing.Currency, req.Currency)
+	setIfPresent(&listing.IsNegotiable, req.IsNegotiable)
+	setIfPresent(&listing.Title, req.Title)
+	setIfPresent(&listing.Description, req.Description)
+	setIfPresent(&listing.City, req.City)
+	setIfPresent(&listing.State, req.State)
+	setIfPresent(&listing.Country, req.Country)
+	setIfPresent(&listing.PostalCode, req.PostalCode)
 
 	if req.Status != nil {
+		// Selling goes through MarkAsSold so sold_at is recorded.
+		if *req.Status != domain.ListingStatusActive && *req.Status != domain.ListingStatusInactive {
+			return nil, domain.ErrInvalidStatus
+		}
 		listing.Status = *req.Status
+	}
+
+	// Validate the resulting listing, so e.g. a new model must belong to
+	// the (possibly unchanged) make.
+	refs, err := uc.refs.get(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := refs.validate(listing, req.FeatureIDs); err != nil {
+		return nil, err
 	}
 
 	listing.UpdatedAt = time.Now()
 
-	// Update listing
-	if err := uc.carRepo.Update(ctx, listing); err != nil {
+	err = uc.tx.WithinTx(ctx, func(ctx context.Context) error {
+		if err := uc.carRepo.Update(ctx, listing); err != nil {
+			return err
+		}
+		if req.FeatureIDs != nil {
+			return uc.carRepo.ReplaceListingFeatures(ctx, listing.ID, req.FeatureIDs)
+		}
+		return nil
+	})
+	if err != nil {
 		return nil, err
 	}
 
-	// Update features if provided
-	if req.FeatureIDs != nil {
-		// Remove old features
-		if err := uc.carRepo.RemoveAllFeaturesFromListing(ctx, listing.ID); err != nil {
-			return nil, err
-		}
+	return uc.load(ctx, listing.ID)
+}
 
-		// Add new features
-		if len(req.FeatureIDs) > 0 {
-			if err := uc.carRepo.AddFeaturesToListing(ctx, listing.ID, req.FeatureIDs); err != nil {
-				return nil, err
-			}
-		}
+func setIfPresent[T any](dst *T, src *T) {
+	if src != nil {
+		*dst = *src
 	}
-
-	// Load full listing with related data
-	return uc.carRepo.GetByID(ctx, listing.ID)
 }
 
 func (uc *carUseCase) Delete(ctx context.Context, id int64, userID int64) error {
-	// Get existing listing
-	listing, err := uc.carRepo.GetByID(ctx, id)
-	if err != nil {
+	if _, err := uc.owned(ctx, id, userID); err != nil {
 		return err
-	}
-
-	// Check ownership
-	if !listing.IsOwner(userID) {
-		return domain.ErrCarListingNotOwner
 	}
 
 	return uc.carRepo.Delete(ctx, id)
@@ -312,27 +242,34 @@ func (uc *carUseCase) Delete(ctx context.Context, id int64, userID int64) error 
 
 func (uc *carUseCase) List(ctx context.Context, filter *domain.CarListingFilter) ([]domain.CarListing, int64, error) {
 	filter.SetDefaults()
-	return uc.carRepo.List(ctx, filter)
+
+	listings, total, err := uc.carRepo.List(ctx, filter)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	refs, err := uc.refs.get(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	for i := range listings {
+		refs.attach(&listings[i])
+		listings[i].ViewsCount += uc.views.Pending(listings[i].ID)
+	}
+
+	return listings, total, nil
 }
 
 func (uc *carUseCase) MarkAsSold(ctx context.Context, id int64, userID int64) error {
-	// Get existing listing
-	listing, err := uc.carRepo.GetByID(ctx, id)
+	listing, err := uc.owned(ctx, id, userID)
 	if err != nil {
 		return err
 	}
 
-	// Check ownership
-	if !listing.IsOwner(userID) {
-		return domain.ErrCarListingNotOwner
-	}
-
-	// Check if already sold
-	if listing.Status == "sold" {
+	if listing.Status == domain.ListingStatusSold {
 		return domain.ErrCarListingAlreadySold
 	}
 
-	// Mark as sold
 	listing.MarkAsSold()
 	return uc.carRepo.Update(ctx, listing)
 }
@@ -340,58 +277,46 @@ func (uc *carUseCase) MarkAsSold(ctx context.Context, id int64, userID int64) er
 // Reference data methods
 
 func (uc *carUseCase) GetAllMakes(ctx context.Context) ([]domain.CarMake, error) {
-	return uc.carRepo.GetAllMakes(ctx)
+	refs, err := uc.refs.get(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return refs.makes, nil
 }
 
 func (uc *carUseCase) GetModelsByMakeID(ctx context.Context, makeID int64) ([]domain.CarModel, error) {
-	return uc.carRepo.GetModelsByMakeID(ctx, makeID)
+	refs, err := uc.refs.get(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	models := []domain.CarModel{}
+	for _, m := range refs.models {
+		if m.MakeID == makeID {
+			models = append(models, m)
+		}
+	}
+	return models, nil
 }
 
-func (uc *carUseCase) GetAllBodyTypes(ctx context.Context) ([]domain.BodyType, error) {
-	return uc.carRepo.GetAllBodyTypes(ctx)
-}
-
-func (uc *carUseCase) GetAllFuelTypes(ctx context.Context) ([]domain.FuelType, error) {
-	return uc.carRepo.GetAllFuelTypes(ctx)
-}
-
-func (uc *carUseCase) GetAllTransmissions(ctx context.Context) ([]domain.TransmissionType, error) {
-	return uc.carRepo.GetAllTransmissions(ctx)
-}
-
-func (uc *carUseCase) GetAllColors(ctx context.Context) ([]domain.Color, error) {
-	return uc.carRepo.GetAllColors(ctx)
-}
-
-func (uc *carUseCase) GetAllConditions(ctx context.Context) ([]domain.CarCondition, error) {
-	return uc.carRepo.GetAllConditions(ctx)
-}
-
-func (uc *carUseCase) GetAllFeatures(ctx context.Context) ([]domain.Feature, error) {
-	return uc.carRepo.GetAllFeatures(ctx)
+func (uc *carUseCase) GetReferenceData(ctx context.Context) (*domain.ReferenceData, error) {
+	refs, err := uc.refs.get(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &refs.data, nil
 }
 
 // Image operations
 
 func (uc *carUseCase) AddImage(ctx context.Context, listingID int64, imageURL string, userID int64) (*domain.CarImage, error) {
-	// Get listing to check ownership
-	listing, err := uc.carRepo.GetByID(ctx, listingID)
-	if err != nil {
+	if _, err := uc.owned(ctx, listingID, userID); err != nil {
 		return nil, err
 	}
-
-	if !listing.IsOwner(userID) {
-		return nil, domain.ErrCarListingNotOwner
-	}
-
-	// Get existing images to determine display order
-	existingImages, _ := uc.carRepo.GetListingImages(ctx, listingID)
 
 	image := &domain.CarImage{
 		CarListingID: listingID,
 		ImageURL:     imageURL,
-		DisplayOrder: len(existingImages),
-		IsPrimary:    len(existingImages) == 0, // First image is primary
 		CreatedAt:    time.Now(),
 	}
 
@@ -402,47 +327,25 @@ func (uc *carUseCase) AddImage(ctx context.Context, listingID int64, imageURL st
 	return image, nil
 }
 
-func (uc *carUseCase) DeleteImage(ctx context.Context, imageID int64, userID int64) error {
-	// Get the image to find its listing
-	images, err := uc.carRepo.GetListingImages(ctx, 0)
-	if err != nil {
+func (uc *carUseCase) DeleteImage(ctx context.Context, listingID int64, imageID int64, userID int64) error {
+	if _, err := uc.owned(ctx, listingID, userID); err != nil {
 		return err
 	}
 
-	var image *domain.CarImage
-	for _, img := range images {
-		if img.ID == imageID {
-			image = &img
-			break
-		}
-	}
-
-	if image == nil {
-		return domain.ErrNotFound
-	}
-
-	// Check listing ownership
-	listing, err := uc.carRepo.GetByID(ctx, image.CarListingID)
+	image, err := uc.carRepo.GetImageByID(ctx, imageID)
 	if err != nil {
 		return err
 	}
-
-	if !listing.IsOwner(userID) {
-		return domain.ErrCarListingNotOwner
+	if image.CarListingID != listingID {
+		return domain.ErrImageNotFound
 	}
 
 	return uc.carRepo.DeleteImage(ctx, imageID)
 }
 
 func (uc *carUseCase) SetPrimaryImage(ctx context.Context, listingID int64, imageID int64, userID int64) error {
-	// Check listing ownership
-	listing, err := uc.carRepo.GetByID(ctx, listingID)
-	if err != nil {
+	if _, err := uc.owned(ctx, listingID, userID); err != nil {
 		return err
-	}
-
-	if !listing.IsOwner(userID) {
-		return domain.ErrCarListingNotOwner
 	}
 
 	return uc.carRepo.SetPrimaryImage(ctx, listingID, imageID)

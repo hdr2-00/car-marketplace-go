@@ -21,6 +21,7 @@ type AuthUseCase interface {
 
 // authUseCase implements AuthUseCase interface
 type authUseCase struct {
+	tx              repository.Transactor
 	userRepo        repository.UserRepository
 	jwtService      security.JWTService
 	passwordHasher  security.PasswordHasher
@@ -30,6 +31,7 @@ type authUseCase struct {
 
 // NewAuthUseCase creates a new auth use case instance
 func NewAuthUseCase(
+	tx repository.Transactor,
 	userRepo repository.UserRepository,
 	jwtService security.JWTService,
 	passwordHasher security.PasswordHasher,
@@ -37,6 +39,7 @@ func NewAuthUseCase(
 	refreshTokenTTL time.Duration,
 ) AuthUseCase {
 	return &authUseCase{
+		tx:              tx,
 		userRepo:        userRepo,
 		jwtService:      jwtService,
 		passwordHasher:  passwordHasher,
@@ -73,7 +76,8 @@ func (uc *authUseCase) Register(ctx context.Context, req *domain.RegisterRequest
 		return nil, domain.ErrInvalidUserType
 	}
 
-	// Create user
+	// Create user and profile together, so a failed profile insert
+	// doesn't leave an account without a profile.
 	user := &domain.User{
 		Email:        req.Email,
 		PasswordHash: hashedPassword,
@@ -84,36 +88,34 @@ func (uc *authUseCase) Register(ctx context.Context, req *domain.RegisterRequest
 		UpdatedAt:    time.Now(),
 	}
 
-	if err := uc.userRepo.Create(ctx, user); err != nil {
+	err = uc.tx.WithinTx(ctx, func(ctx context.Context) error {
+		if err := uc.userRepo.Create(ctx, user); err != nil {
+			return err
+		}
+
+		switch req.UserType {
+		case domain.UserTypeIndividual:
+			return uc.userRepo.CreateUserProfile(ctx, &domain.UserProfile{
+				UserID:      user.ID,
+				FirstName:   req.FirstName,
+				LastName:    req.LastName,
+				PhoneNumber: req.PhoneNumber,
+				CreatedAt:   time.Now(),
+				UpdatedAt:   time.Now(),
+			})
+		case domain.UserTypeDealership, domain.UserTypeShowroom:
+			return uc.userRepo.CreateBusinessProfile(ctx, &domain.BusinessProfile{
+				UserID:       user.ID,
+				BusinessName: req.BusinessName,
+				PhoneNumber:  req.PhoneNumber,
+				CreatedAt:    time.Now(),
+				UpdatedAt:    time.Now(),
+			})
+		}
+		return nil
+	})
+	if err != nil {
 		return nil, err
-	}
-
-	// Create profile based on user type
-	switch req.UserType {
-	case domain.UserTypeIndividual:
-		profile := &domain.UserProfile{
-			UserID:      user.ID,
-			FirstName:   req.FirstName,
-			LastName:    req.LastName,
-			PhoneNumber: req.PhoneNumber,
-			CreatedAt:   time.Now(),
-			UpdatedAt:   time.Now(),
-		}
-		if err := uc.userRepo.CreateUserProfile(ctx, profile); err != nil {
-			return nil, err
-		}
-
-	case domain.UserTypeDealership, domain.UserTypeShowroom:
-		businessProfile := &domain.BusinessProfile{
-			UserID:       user.ID,
-			BusinessName: req.BusinessName,
-			PhoneNumber:  req.PhoneNumber,
-			CreatedAt:    time.Now(),
-			UpdatedAt:    time.Now(),
-		}
-		if err := uc.userRepo.CreateBusinessProfile(ctx, businessProfile); err != nil {
-			return nil, err
-		}
 	}
 
 	// Load user type for response
@@ -152,42 +154,34 @@ func (uc *authUseCase) Login(ctx context.Context, req *domain.LoginRequest) (*do
 	return tokenPair, user, nil
 }
 
-// RefreshToken generates new access token using refresh token
+// RefreshToken exchanges a refresh token for a new token pair. The old token
+// is consumed atomically, so a token can be used at most once.
 func (uc *authUseCase) RefreshToken(ctx context.Context, refreshToken string) (*domain.TokenPair, error) {
-	// Get refresh token from database
-	token, err := uc.userRepo.GetRefreshToken(ctx, refreshToken)
-	if err != nil {
-		return nil, domain.ErrInvalidRefreshToken
-	}
+	var tokenPair *domain.TokenPair
 
-	// Validate token
-	if !token.IsValid() {
-		return nil, domain.ErrInvalidRefreshToken
-	}
+	err := uc.tx.WithinTx(ctx, func(ctx context.Context) error {
+		token, err := uc.userRepo.ConsumeRefreshToken(ctx, refreshToken)
+		if err != nil {
+			return err
+		}
 
-	// Get user
-	user, err := uc.userRepo.GetByID(ctx, token.UserID)
-	if err != nil {
-		return nil, err
-	}
+		user, err := uc.userRepo.GetByID(ctx, token.UserID)
+		if err != nil {
+			return err
+		}
 
-	// Check if user is active
-	if !user.IsActive {
-		return nil, domain.ErrUserNotActive
-	}
+		if !user.IsActive {
+			return domain.ErrUserNotActive
+		}
 
-	// Revoke old refresh token
-	if err := uc.userRepo.RevokeRefreshToken(ctx, refreshToken); err != nil {
-		return nil, err
-	}
-
-	// Generate new token pair
-	newTokenPair, err := uc.generateTokenPair(ctx, user)
+		tokenPair, err = uc.generateTokenPair(ctx, user)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	return newTokenPair, nil
+	return tokenPair, nil
 }
 
 // Logout revokes a specific refresh token
@@ -223,12 +217,13 @@ func (uc *authUseCase) ChangePassword(ctx context.Context, userID int64, req *do
 	user.PasswordHash = newHash
 	user.UpdatedAt = time.Now()
 
-	if err := uc.userRepo.Update(ctx, user); err != nil {
-		return err
-	}
-
-	// Revoke all existing tokens to force re-login
-	return uc.userRepo.RevokeAllUserTokens(ctx, userID)
+	// Update the password and revoke all existing tokens to force re-login
+	return uc.tx.WithinTx(ctx, func(ctx context.Context) error {
+		if err := uc.userRepo.Update(ctx, user); err != nil {
+			return err
+		}
+		return uc.userRepo.RevokeAllUserTokens(ctx, userID)
+	})
 }
 
 // GetUserByID retrieves a user by ID

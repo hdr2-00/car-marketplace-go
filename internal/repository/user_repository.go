@@ -30,7 +30,10 @@ type UserRepository interface {
 
 	// Refresh token operations
 	CreateRefreshToken(ctx context.Context, token *domain.RefreshToken) error
-	GetRefreshToken(ctx context.Context, token string) (*domain.RefreshToken, error)
+	// ConsumeRefreshToken atomically revokes a valid token and returns it;
+	// it fails with domain.ErrInvalidRefreshToken if the token is unknown,
+	// expired or already used.
+	ConsumeRefreshToken(ctx context.Context, token string) (*domain.RefreshToken, error)
 	RevokeRefreshToken(ctx context.Context, token string) error
 	RevokeAllUserTokens(ctx context.Context, userID int64) error
 	DeleteExpiredTokens(ctx context.Context) error

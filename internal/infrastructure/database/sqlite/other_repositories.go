@@ -26,12 +26,15 @@ func (r *inquiryRepository) Create(ctx context.Context, inquiry *domain.Inquiry)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 	`
 
-	result, err := r.db.ExecContext(ctx, query,
+	result, err := conn(ctx, r.db).ExecContext(ctx, query,
 		inquiry.CarListingID, inquiry.BuyerID, inquiry.SellerID, inquiry.Subject,
 		inquiry.Message, inquiry.IsRead, inquiry.CreatedAt,
 	)
 
 	if err != nil {
+		if isForeignKeyViolation(err) {
+			return domain.ErrCarListingNotFound
+		}
 		return err
 	}
 
@@ -52,7 +55,7 @@ func (r *inquiryRepository) GetByID(ctx context.Context, id int64) (*domain.Inqu
 	`
 
 	inquiry := &domain.Inquiry{}
-	err := r.db.QueryRowContext(ctx, query, id).Scan(
+	err := conn(ctx, r.db).QueryRowContext(ctx, query, id).Scan(
 		&inquiry.ID, &inquiry.CarListingID, &inquiry.BuyerID, &inquiry.SellerID,
 		&inquiry.Subject, &inquiry.Message, &inquiry.IsRead, &inquiry.CreatedAt,
 	)
@@ -73,7 +76,7 @@ func (r *inquiryRepository) List(ctx context.Context, filter *domain.InquiryFilt
 	// Count total
 	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM inquiries %s", where)
 	var total int64
-	if err := r.db.QueryRowContext(ctx, countQuery, args...).Scan(&total); err != nil {
+	if err := conn(ctx, r.db).QueryRowContext(ctx, countQuery, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 
@@ -92,7 +95,7 @@ func (r *inquiryRepository) List(ctx context.Context, filter *domain.InquiryFilt
 	`, where)
 
 	args = append(args, filter.Limit, offset)
-	rows, err := r.db.QueryContext(ctx, query, args...)
+	rows, err := conn(ctx, r.db).QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -109,18 +112,35 @@ func (r *inquiryRepository) List(ctx context.Context, filter *domain.InquiryFilt
 		inquiries = append(inquiries, inq)
 	}
 
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+
 	return inquiries, total, nil
 }
 
 func (r *inquiryRepository) MarkAsRead(ctx context.Context, id int64) error {
 	query := `UPDATE inquiries SET is_read = 1 WHERE id = ?`
-	_, err := r.db.ExecContext(ctx, query, id)
-	return err
+	result, err := conn(ctx, r.db).ExecContext(ctx, query, id)
+	if err != nil {
+		return err
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+
+	if rowsAffected == 0 {
+		return domain.ErrInquiryNotFound
+	}
+
+	return nil
 }
 
 func (r *inquiryRepository) Delete(ctx context.Context, id int64) error {
 	query := `DELETE FROM inquiries WHERE id = ?`
-	result, err := r.db.ExecContext(ctx, query, id)
+	result, err := conn(ctx, r.db).ExecContext(ctx, query, id)
 	if err != nil {
 		return err
 	}
@@ -140,6 +160,11 @@ func (r *inquiryRepository) Delete(ctx context.Context, id int64) error {
 func (r *inquiryRepository) buildInquiryWhere(filter *domain.InquiryFilter) (string, []interface{}) {
 	var conditions []string
 	var args []interface{}
+
+	if filter.ParticipantID != nil {
+		conditions = append(conditions, "(buyer_id = ? OR seller_id = ?)")
+		args = append(args, *filter.ParticipantID, *filter.ParticipantID)
+	}
 
 	if filter.CarListingID != nil {
 		conditions = append(conditions, "car_listing_id = ?")
@@ -184,13 +209,13 @@ func (r *reviewRepository) Create(ctx context.Context, review *domain.Review) er
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 
-	result, err := r.db.ExecContext(ctx, query,
+	result, err := conn(ctx, r.db).ExecContext(ctx, query,
 		review.ReviewerID, review.ReviewedUserID, review.CarListingID, review.Rating,
 		review.Title, review.Comment, review.IsVerifiedPurchase, review.CreatedAt, review.UpdatedAt,
 	)
 
 	if err != nil {
-		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+		if isUniqueViolation(err, "reviews.") {
 			return domain.ErrReviewAlreadyExists
 		}
 		return err
@@ -214,7 +239,7 @@ func (r *reviewRepository) GetByID(ctx context.Context, id int64) (*domain.Revie
 
 	review := &domain.Review{}
 	var carListingID sql.NullInt64
-	err := r.db.QueryRowContext(ctx, query, id).Scan(
+	err := conn(ctx, r.db).QueryRowContext(ctx, query, id).Scan(
 		&review.ID, &review.ReviewerID, &review.ReviewedUserID, &carListingID,
 		&review.Rating, &review.Title, &review.Comment, &review.IsVerifiedPurchase,
 		&review.CreatedAt, &review.UpdatedAt,
@@ -241,7 +266,7 @@ func (r *reviewRepository) Update(ctx context.Context, review *domain.Review) er
 		WHERE id = ?
 	`
 
-	result, err := r.db.ExecContext(ctx, query,
+	result, err := conn(ctx, r.db).ExecContext(ctx, query,
 		review.Rating, review.Title, review.Comment, review.UpdatedAt, review.ID,
 	)
 
@@ -263,7 +288,7 @@ func (r *reviewRepository) Update(ctx context.Context, review *domain.Review) er
 
 func (r *reviewRepository) Delete(ctx context.Context, id int64) error {
 	query := `DELETE FROM reviews WHERE id = ?`
-	result, err := r.db.ExecContext(ctx, query, id)
+	result, err := conn(ctx, r.db).ExecContext(ctx, query, id)
 	if err != nil {
 		return err
 	}
@@ -286,7 +311,7 @@ func (r *reviewRepository) List(ctx context.Context, filter *domain.ReviewFilter
 	// Count total
 	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM reviews %s", where)
 	var total int64
-	if err := r.db.QueryRowContext(ctx, countQuery, args...).Scan(&total); err != nil {
+	if err := conn(ctx, r.db).QueryRowContext(ctx, countQuery, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 
@@ -305,7 +330,7 @@ func (r *reviewRepository) List(ctx context.Context, filter *domain.ReviewFilter
 	`, where)
 
 	args = append(args, filter.Limit, offset)
-	rows, err := r.db.QueryContext(ctx, query, args...)
+	rows, err := conn(ctx, r.db).QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -325,6 +350,10 @@ func (r *reviewRepository) List(ctx context.Context, filter *domain.ReviewFilter
 			rev.CarListingID = &carListingID.Int64
 		}
 		reviews = append(reviews, rev)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
 	}
 
 	return reviews, total, nil
@@ -348,7 +377,7 @@ func (r *reviewRepository) GetUserStats(ctx context.Context, userID int64) (*dom
 	var avgRating sql.NullFloat64
 	var r1, r2, r3, r4, r5 int
 
-	err := r.db.QueryRowContext(ctx, query, userID).Scan(
+	err := conn(ctx, r.db).QueryRowContext(ctx, query, userID).Scan(
 		&total, &avgRating, &r1, &r2, &r3, &r4, &r5,
 	)
 
@@ -378,10 +407,12 @@ func (r *reviewRepository) HasReviewed(ctx context.Context, reviewerID, reviewed
 	if carListingID != nil {
 		query += " AND car_listing_id = ?"
 		args = append(args, *carListingID)
+	} else {
+		query += " AND car_listing_id IS NULL"
 	}
 
 	var count int
-	err := r.db.QueryRowContext(ctx, query, args...).Scan(&count)
+	err := conn(ctx, r.db).QueryRowContext(ctx, query, args...).Scan(&count)
 	if err != nil {
 		return false, err
 	}
@@ -441,13 +472,16 @@ func (r *favoriteRepository) Create(ctx context.Context, favorite *domain.Favori
 		VALUES (?, ?, ?)
 	`
 
-	result, err := r.db.ExecContext(ctx, query,
+	result, err := conn(ctx, r.db).ExecContext(ctx, query,
 		favorite.UserID, favorite.CarListingID, favorite.CreatedAt,
 	)
 
 	if err != nil {
-		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+		if isUniqueViolation(err, "favorites.") {
 			return domain.ErrFavoriteAlreadyExists
+		}
+		if isForeignKeyViolation(err) {
+			return domain.ErrCarListingNotFound
 		}
 		return err
 	}
@@ -463,7 +497,7 @@ func (r *favoriteRepository) Create(ctx context.Context, favorite *domain.Favori
 
 func (r *favoriteRepository) Delete(ctx context.Context, userID, carListingID int64) error {
 	query := `DELETE FROM favorites WHERE user_id = ? AND car_listing_id = ?`
-	result, err := r.db.ExecContext(ctx, query, userID, carListingID)
+	result, err := conn(ctx, r.db).ExecContext(ctx, query, userID, carListingID)
 	if err != nil {
 		return err
 	}
@@ -483,7 +517,7 @@ func (r *favoriteRepository) Delete(ctx context.Context, userID, carListingID in
 func (r *favoriteRepository) Exists(ctx context.Context, userID, carListingID int64) (bool, error) {
 	query := `SELECT COUNT(*) FROM favorites WHERE user_id = ? AND car_listing_id = ?`
 	var count int
-	err := r.db.QueryRowContext(ctx, query, userID, carListingID).Scan(&count)
+	err := conn(ctx, r.db).QueryRowContext(ctx, query, userID, carListingID).Scan(&count)
 	if err != nil {
 		return false, err
 	}
@@ -494,7 +528,7 @@ func (r *favoriteRepository) List(ctx context.Context, filter *domain.FavoriteFi
 	// Count total
 	countQuery := `SELECT COUNT(*) FROM favorites WHERE user_id = ?`
 	var total int64
-	if err := r.db.QueryRowContext(ctx, countQuery, filter.UserID).Scan(&total); err != nil {
+	if err := conn(ctx, r.db).QueryRowContext(ctx, countQuery, filter.UserID).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 
@@ -512,7 +546,7 @@ func (r *favoriteRepository) List(ctx context.Context, filter *domain.FavoriteFi
 		LIMIT ? OFFSET ?
 	`
 
-	rows, err := r.db.QueryContext(ctx, query, filter.UserID, filter.Limit, offset)
+	rows, err := conn(ctx, r.db).QueryContext(ctx, query, filter.UserID, filter.Limit, offset)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -528,6 +562,10 @@ func (r *favoriteRepository) List(ctx context.Context, filter *domain.FavoriteFi
 		favorites = append(favorites, fav)
 	}
 
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+
 	return favorites, total, nil
 }
 
@@ -535,7 +573,7 @@ func (r *favoriteRepository) GetByID(ctx context.Context, id int64) (*domain.Fav
 	query := `SELECT id, user_id, car_listing_id, created_at FROM favorites WHERE id = ?`
 
 	favorite := &domain.Favorite{}
-	err := r.db.QueryRowContext(ctx, query, id).Scan(
+	err := conn(ctx, r.db).QueryRowContext(ctx, query, id).Scan(
 		&favorite.ID, &favorite.UserID, &favorite.CarListingID, &favorite.CreatedAt,
 	)
 
